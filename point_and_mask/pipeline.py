@@ -11,7 +11,7 @@ from diffusers.pipelines.flux.pipeline_flux import retrieve_timesteps, calculate
 from diffusers.pipelines.flux.pipeline_output import FluxPipelineOutput
 from diffusers.utils.torch_utils import randn_tensor
 
-from attention_processor import get_curr_fg_mask, get_cross_sim
+from .attention_processor import get_curr_fg_mask, get_cross_sim
 
 
 class MaskPointPipeline(FluxPipeline):

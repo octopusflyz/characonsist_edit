@@ -1,0 +1,12 @@
+bg_prompts = [
+    "in a colorful theme park, roller coasters and amusement rides in the background,",
+    "in an arcade, flashing lights and game machines in the background,",
+    "in a fantasy-themed park, castles and fairy tale characters in the background,"
+]
+fg_prompt = ("a young white boy with curly brown hair, wearing a blue T-shirt and brown shorts; "
+            "a young black boy with straight brown hair, wearing a brown T-shirt and blue shorts")
+act_prompts = [
+    "riding a roller coaster, excited expression, front view",
+    "playing an arcade game, focused expression, side view",
+    "posing with a costumed character, happy expression, front view"
+]
