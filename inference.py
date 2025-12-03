@@ -8,6 +8,7 @@ parser.add_argument("--out_dir", type=str, default="results")
 parser.add_argument("--use_interpolate", action='store_true')
 parser.add_argument("--share_bg", action='store_true')
 parser.add_argument("--save_mask", action='store_true')
+parser.add_argument("--save_cache", action='store_true', help="Save intermediate results to .pt file for visualization")
 parser.add_argument("--height", type=int, default=1024)
 parser.add_argument("--width", type=int, default=1024)
 parser.add_argument("--seed", type=int, default=2025)
@@ -25,6 +26,8 @@ from models.attention_processor_characonsist import (
     reset_id_bank,
 )
 from models.pipeline_characonsist import CharaConsistPipeline
+from visualize_gr import save_point_match_package
+from datetime import datetime
 
 
 def init_model_mode_0():
@@ -86,7 +89,7 @@ def modify_prompt_and_get_length(bg, fg, act, pipe):
 def load_prompt_file(pipe, file_path):
     with open(file_path, "r") as f:
         all_lines = f.readlines()
-    all_prompt_info, curr_prompts, curr_bg_len, curr_real_len = [], [], [], []
+    all_prompt_info, curr_prompts, curr_bg_len, curr_real_len, curr_bg_fg_act = [], [], [], [], []
     for line in all_lines:
         prompt = line.strip()
         if len(prompt) > 0:
@@ -95,11 +98,12 @@ def load_prompt_file(pipe, file_path):
             curr_prompts.append(prompt)
             curr_bg_len.append(bg_len)
             curr_real_len.append(real_len)
+            curr_bg_fg_act.append((bg, fg, act))
         else:
-            all_prompt_info.append((curr_prompts, curr_bg_len, curr_real_len))
-            curr_prompts, curr_bg_len, curr_real_len = [], [], []
+            all_prompt_info.append((curr_prompts, curr_bg_len, curr_real_len, curr_bg_fg_act))
+            curr_prompts, curr_bg_len, curr_real_len, curr_bg_fg_act = [], [], [], []
     if len(curr_prompts) > 0:
-        all_prompt_info.append((curr_prompts, curr_bg_len, curr_real_len))
+        all_prompt_info.append((curr_prompts, curr_bg_len, curr_real_len, curr_bg_fg_act))
     return all_prompt_info
 
 from PIL import Image
@@ -135,12 +139,30 @@ if __name__ == "__main__":
         share_bg = args.share_bg
     )
 
-    for prompt_ind, (prompts, bg_lens, real_lens) in enumerate(all_prompt_info):
+    for prompt_ind, (prompts, bg_lens, real_lens, bg_fg_act_list) in enumerate(all_prompt_info):
         out_dir = os.path.join(args.out_dir, f"prompt_{prompt_ind}")
         os.makedirs(out_dir, exist_ok=True)
         if args.save_mask:
             mask_out_dir = os.path.join(args.out_dir, f"prompt_{prompt_ind}", "mask")
             os.makedirs(mask_out_dir, exist_ok=True)
+        if args.save_cache:
+            point_match_save_dir = os.path.join(args.out_dir, f"prompt_{prompt_ind}", "point_pkgs")
+            os.makedirs(point_match_save_dir, exist_ok=True)
+            cache_dir = os.path.join(args.out_dir, f"prompt_{prompt_ind}", "cache")
+            os.makedirs(cache_dir, exist_ok=True)
+            cache_path = os.path.join(cache_dir, f"cache_{datetime.now().strftime('%Y%m%d-%H%M%S')}.pt")
+            cache_payload = None
+        
+        # 提取 bg_prompts, fg_prompt, act_prompts
+        bg_prompts = [item[0] for item in bg_fg_act_list]
+        # 检查所有 prompt 是否共享同一个 fg（通常情况）
+        fg_prompts = [item[1] for item in bg_fg_act_list]
+        if len(set(fg_prompts)) == 1:
+            fg_prompt = fg_prompts[0]  # 所有 prompt 共享同一个 fg
+        else:
+            fg_prompt = fg_prompts[0]  # 如果不相同，使用第一个（用于兼容性）
+        act_prompts = [item[2] for item in bg_fg_act_list]
+        
         id_prompt = prompts[0]
         frm_prompts = prompts[1:]
 
@@ -154,6 +176,29 @@ if __name__ == "__main__":
         id_images[0].save(f"{out_dir}/id.jpg")
         if args.save_mask:
             overlay_mask_on_image(id_images[0], id_fg_mask[0].cpu().numpy(), (255, 0, 0), f"{mask_out_dir}/id_mask.jpg")
+        
+        if args.save_cache:
+            cache_payload = dict(
+                meta=dict(
+                    bg_prompts=bg_prompts,
+                    fg_prompt=fg_prompt,
+                    act_prompts=act_prompts,
+                    seed=args.seed,
+                    height=args.height,
+                    width=args.width,
+                    init_mode=args.init_mode,
+                ),
+                id=dict(
+                    prompt=id_prompt,
+                    bg_prompt=bg_prompts[0],
+                    act_prompt=act_prompts[0],
+                    bg_len=bg_lens[0],
+                    real_len=real_lens[0],
+                    image=np.array(id_images[0]),
+                    mask=id_fg_mask[0].cpu().numpy(),
+                ),
+                frames=[],
+            )
 
         # Frame Gen
         spatial_kwargs = dict(id_fg_mask = id_fg_mask, id_bg_mask = ~id_fg_mask)
@@ -169,4 +214,38 @@ if __name__ == "__main__":
             images[0].save(f"{out_dir}/{ind}.jpg")
             if args.save_mask:
                 overlay_mask_on_image(images[0], spatial_kwargs["curr_fg_mask"][0].cpu().numpy(), (255, 0, 0), f"{mask_out_dir}/{ind}_mask.jpg")
+            
+            if args.save_cache and cache_payload is not None:
+                frame_entry = dict(
+                    index=ind,
+                    prompt=prompt,
+                    bg_prompt=bg_prompts[1:][ind],
+                    act_prompt=act_prompts[1:][ind],
+                    bg_len=bg_lens[1:][ind],
+                    real_len=real_lens[1:][ind],
+                    image=np.array(images[0]),
+                    mask=spatial_kwargs["curr_fg_mask"][0].cpu().numpy(),
+                )
+                if "argmax_indices" in spatial_kwargs:
+                    frame_entry["argmax_indices"] = spatial_kwargs["argmax_indices"][0].cpu().numpy()
+                if "max_sim" in spatial_kwargs:
+                    frame_entry["max_sim"] = spatial_kwargs["max_sim"][0].float().cpu().numpy()
+                cache_payload["frames"].append(frame_entry)
+
+                if ("argmax_indices" in spatial_kwargs) and ("max_sim" in spatial_kwargs):
+                    npz_path = os.path.join(point_match_save_dir, f"frame_{ind:02d}.npz")
+                    save_point_match_package(
+                        npz_path,
+                        id_images[0],
+                        images[0],
+                        id_fg_mask[0],
+                        spatial_kwargs["curr_fg_mask"][0],
+                        spatial_kwargs["argmax_indices"][0],
+                        spatial_kwargs["max_sim"][0].float(),
+                    )
+        
+        if args.save_cache and cache_payload is not None:
+            torch.save(cache_payload, cache_path)
+            print(f"Intermediate data saved to {cache_path}")
+        
         reset_id_bank(pipe)
