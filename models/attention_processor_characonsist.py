@@ -138,6 +138,9 @@ class CharaConsistAttnProcessor2_0:
         self.bg_len = 0
         self.real_len = 0
         self.size = size
+        # Multi-object support
+        self.num_objects = 1
+        self.object_token_ranges = None
         # Save id info
         self.id_attn_bank = dict()
         self.attn_weights = dict()
@@ -148,7 +151,19 @@ class CharaConsistAttnProcessor2_0:
         attn_weights = attn_weights.softmax(-1).sum(1)
         attn_weights = rearrange(attn_weights, "b (h w) s -> b s h w", h=self.size[0], w=self.size[1])
         bg_attn_weights = attn_weights[:, :self.bg_len].mean(1)
-        fg_attn_weights = attn_weights[:, self.bg_len:].mean(1)       
+        
+        # 支持多对象：为每个对象单独计算fg注意力权重
+        if self.num_objects > 1 and self.object_token_ranges is not None:
+            object_fg_attn_weights = []
+            for start_token, end_token in self.object_token_ranges:
+                obj_fg_attn = attn_weights[:, start_token:end_token].mean(1)
+                object_fg_attn_weights.append(obj_fg_attn)
+            # 为了向后兼容，仍然返回平均的fg_attn_weights
+            fg_attn_weights = sum(object_fg_attn_weights) / len(object_fg_attn_weights)
+        else:
+            # 单对象情况，保持原有逻辑
+            fg_attn_weights = attn_weights[:, self.bg_len:].mean(1)
+        
         return bg_attn_weights, fg_attn_weights
     
     def get_curr_cross_sim(self, curr_hidden_states, timestep_ind):
@@ -340,7 +355,19 @@ class CharaConsistAttnProcessor2_0:
 
         if save_attn_weight:
             bg_attn, fg_attn = self.get_curr_attn_weights(query, key)
-            self.attn_weights = dict(bg = bg_attn.to("cuda:0", non_blocking=True), fg = fg_attn.to("cuda:0", non_blocking=True))
+            # 支持多对象：保存每个对象的注意力权重
+            if self.num_objects > 1 and self.object_token_ranges is not None:
+                attn_weights_temp = torch.matmul(query[:, :, self.text_seq_len:], key[:, :, :self.real_len].transpose(-2, -1)).to(torch.float16)
+                attn_weights_temp = attn_weights_temp.softmax(-1).sum(1)
+                attn_weights_temp = rearrange(attn_weights_temp, "b (h w) s -> b s h w", h=self.size[0], w=self.size[1])
+                object_fg_attns = []
+                for start_token, end_token in self.object_token_ranges:
+                    obj_fg_attn = attn_weights_temp[:, start_token:end_token].mean(1)
+                    object_fg_attns.append(obj_fg_attn.to("cuda:0", non_blocking=True))
+                self.attn_weights = dict(bg=bg_attn.to("cuda:0", non_blocking=True), objects=object_fg_attns)
+            else:
+                # 单对象情况，保持原有格式
+                self.attn_weights = dict(bg=bg_attn.to("cuda:0", non_blocking=True), fg=fg_attn.to("cuda:0", non_blocking=True))
         
         fg_share_flag = self.fg_share_flag and fg_inter_img_attn
         bg_share_flag = self.bg_share_flag and bg_inter_img_attn and (not update_attn_kv)
@@ -412,7 +439,16 @@ def reset_attn_processor(pipe, size, fg_share_freq=2, bg_share_freq=1):
     print(f"{reset_num} layers have been reset")
 
 
-def set_text_len(pipe, bg_len, real_len):
+def set_text_len(pipe, bg_len, real_len, num_objects=None, object_token_ranges=None):
+    """设置文本长度，支持多对象
+    
+    Args:
+        pipe: pipeline对象
+        bg_len: 背景token长度
+        real_len: 总token长度
+        num_objects: 对象数量（可选）
+        object_token_ranges: 每个对象对应的token范围列表（可选）
+    """
     attn_processors = pipe.transformer.attn_processors
     reset_num = 0
     for name in attn_processors:
@@ -420,8 +456,14 @@ def set_text_len(pipe, bg_len, real_len):
         if isinstance(processor, CharaConsistAttnProcessor2_0):
             processor.bg_len = bg_len
             processor.real_len = real_len
+            if num_objects is not None:
+                processor.num_objects = num_objects
+            if object_token_ranges is not None:
+                processor.object_token_ranges = object_token_ranges
             reset_num += 1
     print(f"{reset_num} layers' background and real text length have been reset to {bg_len} and {real_len}.")
+    if num_objects and num_objects > 1:
+        print(f"Multi-object mode: {num_objects} objects detected.")
 
 def remove_small_holes_and_points(mask_tensor):
     n, h, w = mask_tensor.shape
@@ -437,18 +479,177 @@ def remove_small_holes_and_points(mask_tensor):
     return results
 
 def get_curr_fg_mask(pipe):
+    """获取前景mask，支持多对象"""
     attn_processors = pipe.transformer.attn_processors
-    all_attn_weights = dict(bg = [], fg = [])
+    all_attn_weights = dict(bg=[], fg=[], objects=[])
+    num_objects = 1
+    
+    # 检查是否是多对象模式
+    for name in attn_processors:
+        processor = attn_processors[name]
+        if isinstance(processor, CharaConsistAttnProcessor2_0):
+            if hasattr(processor, 'num_objects') and processor.num_objects > 1:
+                num_objects = processor.num_objects
+            break
+    
     for name in attn_processors:
         processor = attn_processors[name]
         if isinstance(processor, CharaConsistAttnProcessor2_0):
             saved_attns = processor.attn_weights
             for k in saved_attns:
+                if k not in all_attn_weights:
+                    all_attn_weights[k] = []
                 all_attn_weights[k].append(saved_attns[k])
             processor.attn_weights = dict()
+    
     bg_attns = sum(all_attn_weights["bg"]) / len(all_attn_weights["bg"])
-    fg_attns = sum(all_attn_weights["fg"]) / len(all_attn_weights["fg"])
-    return remove_small_holes_and_points(bg_attns <= fg_attns)
+    
+    # 多对象模式：合并所有对象的mask
+    if num_objects > 1 and "objects" in all_attn_weights and len(all_attn_weights["objects"]) > 0:
+        # 获取第一个processor的object_token_ranges
+        object_token_ranges = None
+        for name in attn_processors:
+            processor = attn_processors[name]
+            if isinstance(processor, CharaConsistAttnProcessor2_0) and hasattr(processor, 'object_token_ranges'):
+                object_token_ranges = processor.object_token_ranges
+                break
+        
+        # 为每个对象计算mask，然后合并（使用与get_multi_object_fg_masks相同的逻辑）
+        # 收集所有对象的attention权重
+        all_obj_attns = []
+        for obj_idx in range(num_objects):
+            obj_attn_list = [obj_attns[obj_idx] for obj_attns in all_attn_weights["objects"] if len(obj_attns) > obj_idx]
+            if len(obj_attn_list) > 0:
+                obj_attn = sum(obj_attn_list) / len(obj_attn_list)
+                # 确保obj_attn是2维的 [H, W]
+                if len(obj_attn.shape) == 3:
+                    obj_attn = obj_attn.squeeze(0)
+                elif len(obj_attn.shape) != 2:
+                    obj_attn = obj_attn.view(-1, obj_attn.shape[-2], obj_attn.shape[-1])[0]
+                all_obj_attns.append(obj_attn)
+            else:
+                all_obj_attns.append(torch.zeros_like(bg_attns))
+        
+        # 使用对象间的相对比较来提取mask，然后合并
+        if len(all_obj_attns) > 0:
+            stacked_obj_attns = torch.stack(all_obj_attns, dim=0)  # [num_objects, H, W]
+            max_obj_attn, max_obj_idx = torch.max(stacked_obj_attns, dim=0)  # [H, W]
+            
+            # 为每个对象生成mask并合并
+            combined_mask = None
+            for obj_idx in range(num_objects):
+                is_max_obj = (max_obj_idx == obj_idx)
+                obj_gt_bg = (all_obj_attns[obj_idx] > bg_attns)
+                obj_mask = is_max_obj & obj_gt_bg
+                # 确保obj_mask是2维的 [H, W]，然后添加batch维度
+                if len(obj_mask.shape) == 3:
+                    obj_mask = obj_mask.squeeze(0)  # 如果是 [1, H, W]，去掉第一个维度
+                elif len(obj_mask.shape) != 2:
+                    # 如果不是2维，尝试reshape
+                    obj_mask = obj_mask.view(-1, obj_mask.shape[-2], obj_mask.shape[-1])[0]
+                obj_mask = remove_small_holes_and_points(obj_mask.unsqueeze(0))[0]
+                
+                if combined_mask is None:
+                    combined_mask = obj_mask
+                else:
+                    combined_mask = combined_mask | obj_mask
+            
+            if combined_mask is not None:
+                return combined_mask
+        else:
+            # 回退到单对象模式
+            fg_attns = sum(all_attn_weights["fg"]) / len(all_attn_weights["fg"])
+            return remove_small_holes_and_points(bg_attns <= fg_attns)
+    else:
+        # 单对象模式，保持原有逻辑
+        fg_attns = sum(all_attn_weights["fg"]) / len(all_attn_weights["fg"])
+        return remove_small_holes_and_points(bg_attns <= fg_attns)
+
+def get_multi_object_fg_masks(pipe):
+    """获取每个对象的独立fg mask（多对象模式）"""
+    attn_processors = pipe.transformer.attn_processors
+    all_attn_weights = dict(bg=[], objects=[])
+    num_objects = 1
+    object_token_ranges = None
+    
+    # 获取对象信息
+    for name in attn_processors:
+        processor = attn_processors[name]
+        if isinstance(processor, CharaConsistAttnProcessor2_0):
+            if hasattr(processor, 'num_objects') and processor.num_objects > 1:
+                num_objects = processor.num_objects
+                object_token_ranges = getattr(processor, 'object_token_ranges', None)
+            break
+    
+    if num_objects <= 1:
+        # 单对象模式，返回单个mask
+        return [get_curr_fg_mask(pipe)]
+    
+    for name in attn_processors:
+        processor = attn_processors[name]
+        if isinstance(processor, CharaConsistAttnProcessor2_0):
+            saved_attns = processor.attn_weights
+            for k in saved_attns:
+                if k not in all_attn_weights:
+                    all_attn_weights[k] = []
+                all_attn_weights[k].append(saved_attns[k])
+            processor.attn_weights = dict()
+    
+    bg_attns = sum(all_attn_weights["bg"]) / len(all_attn_weights["bg"])
+    # 确保bg_attns是2维的 [H, W]
+    if len(bg_attns.shape) == 3:
+        bg_attns = bg_attns.squeeze(0)  # 如果是 [1, H, W]，去掉第一个维度
+    elif len(bg_attns.shape) != 2:
+        bg_attns = bg_attns.view(-1, bg_attns.shape[-2], bg_attns.shape[-1])[0]
+    
+    # 为每个对象生成独立的mask
+    object_masks = []
+    if "objects" in all_attn_weights and len(all_attn_weights["objects"]) > 0:
+        # 收集所有对象的attention权重
+        all_obj_attns = []
+        for obj_idx in range(num_objects):
+            obj_attn_list = [obj_attns[obj_idx] for obj_attns in all_attn_weights["objects"] if len(obj_attns) > obj_idx]
+            if len(obj_attn_list) > 0:
+                obj_attn = sum(obj_attn_list) / len(obj_attn_list)
+                # 确保obj_attn是2维的 [H, W]
+                if len(obj_attn.shape) == 3:
+                    obj_attn = obj_attn.squeeze(0)
+                elif len(obj_attn.shape) != 2:
+                    obj_attn = obj_attn.view(-1, obj_attn.shape[-2], obj_attn.shape[-1])[0]
+                all_obj_attns.append(obj_attn)
+            else:
+                # 如果没有找到该对象的注意力权重，创建一个零tensor
+                all_obj_attns.append(torch.zeros_like(bg_attns))
+        
+        # 使用对象间的相对比较来提取mask
+        # 方法：每个像素属于attention最高的对象，且该对象的attention要大于背景
+        if len(all_obj_attns) > 0:
+            # 将所有对象的attention堆叠起来 [num_objects, H, W]
+            stacked_obj_attns = torch.stack(all_obj_attns, dim=0)  # [num_objects, H, W]
+            
+            # 找到每个像素对应的最大attention的对象索引
+            max_obj_attn, max_obj_idx = torch.max(stacked_obj_attns, dim=0)  # [H, W]
+            
+            # 为每个对象生成mask：该对象是最大attention的对象，且大于背景attention
+            for obj_idx in range(num_objects):
+                # 该对象是最大attention的对象
+                is_max_obj = (max_obj_idx == obj_idx)
+                # 该对象的attention大于背景attention
+                obj_gt_bg = (all_obj_attns[obj_idx] > bg_attns)
+                # 组合条件：既是最大attention的对象，又大于背景attention
+                obj_mask = is_max_obj & obj_gt_bg
+                # 确保obj_mask是2维的 [H, W]，然后添加batch维度
+                if len(obj_mask.shape) == 3:
+                    obj_mask = obj_mask.squeeze(0)  # 如果是 [1, H, W]，去掉第一个维度
+                elif len(obj_mask.shape) != 2:
+                    # 如果不是2维，尝试reshape
+                    obj_mask = obj_mask.view(-1, obj_mask.shape[-2], obj_mask.shape[-1])[0]
+                # 应用形态学操作（需要添加batch维度）
+                obj_mask = remove_small_holes_and_points(obj_mask.unsqueeze(0))
+                object_masks.append(obj_mask[0])
+    
+    return object_masks if len(object_masks) > 0 else [get_curr_fg_mask(pipe)]
+
 
 def get_cross_sim(pipe):
     attn_processors = pipe.transformer.attn_processors
