@@ -299,4 +299,208 @@ class CharaConsistPipeline(FluxPipeline):
 
         return FluxPipelineOutput(images=image)
 
+    @torch.no_grad()
+    def from_reference_image(
+        self,
+        reference_image: Union["PIL.Image.Image", torch.Tensor],
+        prompt: str,
+        bg_len: Optional[int] = None,
+        real_len: Optional[int] = None,
+        height: Optional[int] = None,
+        width: Optional[int] = None,
+        num_inference_steps: int = 50,
+        guidance_scale: float = 3.5,
+        generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
+        use_interpolate: bool = True,
+        share_bg: bool = True,
+        attn_start_step: int = 1,
+        attn_end_step: int = 41,
+        interpolate_start_step: int = 1,
+        interpolate_decay_step: int = 11,
+        interpolate_end_step: int = 31,
+        interpolate_weight: float = 0.8,
+        sim_thr: float = 0.5,
+        save_mask_point_step: int = 10,
+        **kwargs
+    ):
+        """
+        从参考图像初始化ID特征
+        
+        Args:
+            reference_image: PIL Image 或 torch.Tensor，参考图像
+            prompt: 描述参考图像的完整prompt
+            bg_len: 背景部分的token长度（如果已知）
+            real_len: 完整prompt的token长度（如果已知）
+            height, width: 图像尺寸（如果不提供，将使用参考图像的尺寸）
+            num_inference_steps: 推理步数（可以设置较小值，因为我们主要是获取特征）
+            **kwargs: 其他参数传递给 __call__ 方法
+        
+        Returns:
+            id_images: 生成的图像（应该与参考图像相似）
+            id_spatial_kwargs: 包含 id_fg_mask, id_attn_bank 等中间特征
+        """
+        from PIL import Image
+        
+        device = self._execution_device
+        
+        # 1. 处理参考图像
+        if isinstance(reference_image, Image.Image):
+            # 获取图像尺寸
+            if height is None:
+                height = reference_image.height
+            if width is None:
+                width = reference_image.width
+            
+            # 预处理图像
+            processed_image = self.image_processor.preprocess(reference_image)
+        else:
+            # 如果已经是tensor，直接使用
+            processed_image = reference_image
+            if height is None or width is None:
+                raise ValueError("When reference_image is a tensor, height and width must be provided")
+        
+        # 确保图像在正确的device和dtype上
+        # 检查VAE的实际dtype（可能是bfloat16）
+        if not isinstance(processed_image, torch.Tensor):
+            processed_image = torch.tensor(processed_image)
+        # 获取VAE的dtype，确保输入与VAE的dtype匹配
+        vae_dtype = next(self.vae.parameters()).dtype
+        processed_image = processed_image.to(device=device, dtype=vae_dtype)
+        
+        # 2. 先获取prompt_embeds以确定dtype，然后编码图像
+        prompt_embeds, pooled_prompt_embeds, _ = self.encode_prompt(
+            prompt=prompt,
+            prompt_2=None,
+            device=device,
+            num_images_per_prompt=1,
+            max_sequence_length=512,
+        )
+        
+        # 使用VAE编码图像到latent space
+        with torch.no_grad():
+            # VAE编码：得到 [B, C, H, W] 格式的latent
+            encoded_latents = self.vae.encode(processed_image).latent_dist.sample()
+            # FLUX的VAE需要应用scaling_factor
+            encoded_latents = encoded_latents * self.vae.config.scaling_factor
+            # 确保latent在正确的device和dtype上
+            encoded_latents = encoded_latents.to(device=device, dtype=prompt_embeds.dtype)
+        
+        # 3. 使用prepare_latents生成正确的格式（不传入latents，让它生成格式）
+        num_channels_latents = self.transformer.config.in_channels // 4
+        dummy_latents, latent_image_ids = self.prepare_latents(
+            1,  # batch_size
+            num_channels_latents,
+            height,
+            width,
+            prompt_embeds.dtype,
+            device,
+            generator,
+            None,  # 不传入latents，让它生成正确的pack格式
+        )
+        
+        # 4. 将编码后的latent pack成与dummy_latents相同的格式
+        # dummy_latents是[B, seq_len, C]格式，我们需要将encoded_latents也pack成这个格式
+        B_dummy, seq_len, C_dummy = dummy_latents.shape
+        B, C_vae, H_enc, W_enc = encoded_latents.shape
+        
+        # 问题：VAE输出是16通道，但transformer期望64通道
+        # 需要将16通道扩展到64通道
+        # 方法：使用简单的重复和线性组合
+        if C_vae != C_dummy:
+            # 计算扩展倍数
+            expansion_factor = C_dummy // C_vae
+            remainder = C_dummy % C_vae
+            
+            # 方法1：重复通道并添加一些变化
+            # 将16通道重复4次得到64通道
+            expanded_channels = []
+            for i in range(expansion_factor):
+                expanded_channels.append(encoded_latents)
+            if remainder > 0:
+                # 如果有余数，添加部分通道
+                expanded_channels.append(encoded_latents[:, :remainder])
+            
+            # 拼接得到64通道
+            encoded_latents = torch.cat(expanded_channels, dim=1)
+            C_vae = C_dummy
+        
+        # 计算期望的patch尺寸：seq_len = H_patches * W_patches
+        # 根据height和width的比例来推断
+        aspect_ratio = width / height
+        H_patches = int(np.sqrt(seq_len / aspect_ratio))
+        W_patches = int(seq_len / H_patches)
+        
+        # 如果VAE输出的尺寸不匹配，需要resize
+        if H_enc != H_patches or W_enc != W_patches:
+            encoded_latents = torch.nn.functional.interpolate(
+                encoded_latents, size=(H_patches, W_patches), mode='bilinear', align_corners=False
+            )
+        
+        # Reshape: [B, C, H, W] -> [B, H*W, C] = [B, seq_len, C]
+        latents = encoded_latents.permute(0, 2, 3, 1).reshape(B, H_patches * W_patches, C_vae)
+        
+        # 确保dtype和device匹配
+        latents = latents.to(device=device, dtype=prompt_embeds.dtype)
+        
+        # 最终验证：确保形状完全匹配
+        assert latents.shape == dummy_latents.shape, f"Shape mismatch: {latents.shape} vs {dummy_latents.shape}"
+        
+        # 3. 获取文本编码长度（如果未提供）
+        if bg_len is None or real_len is None:
+            # 尝试从prompt中解析（这里假设prompt格式为 "bg#fg#act"）
+            # 如果格式不同，用户需要手动提供bg_len和real_len
+            if "#" in prompt:
+                parts = prompt.split("#")
+                if len(parts) >= 2:
+                    bg_part = parts[0]
+                    fg_part = "#".join(parts[1:-1]) if len(parts) > 2 else parts[1]
+                    bg_len = self._get_text_tokens_length(bg_part)
+                    real_len = self._get_text_tokens_length(prompt)
+                else:
+                    # 如果无法解析，使用完整prompt
+                    real_len = self._get_text_tokens_length(prompt)
+                    bg_len = 0  # 默认值，可能需要用户手动设置
+            else:
+                real_len = self._get_text_tokens_length(prompt)
+                bg_len = 0  # 默认值
+        
+        # 4. 执行一次forward pass，保存所有中间特征
+        # 关键：设置is_id=True，让系统保存id_attn_bank
+        id_images, id_spatial_kwargs = self(
+            prompt=prompt,
+            height=height,
+            width=width,
+            latents=latents,  # 使用编码后的latent
+            is_id=True,  # 关键：保存所有中间特征
+            num_inference_steps=num_inference_steps,
+            guidance_scale=guidance_scale,
+            generator=generator,
+            use_interpolate=use_interpolate,
+            share_bg=share_bg,
+            attn_start_step=attn_start_step,
+            attn_end_step=attn_end_step,
+            interpolate_start_step=interpolate_start_step,
+            interpolate_decay_step=interpolate_decay_step,
+            interpolate_end_step=interpolate_end_step,
+            interpolate_weight=interpolate_weight,
+            sim_thr=sim_thr,
+            save_mask_point_step=save_mask_point_step,
+            **kwargs
+        )
+        
+        return id_images, id_spatial_kwargs
+    
+    def _get_text_tokens_length(self, text: str) -> int:
+        """辅助方法：获取文本的token长度"""
+        text_mask = self.tokenizer_2(
+            text,
+            padding="max_length",
+            max_length=512,
+            truncation=True,
+            return_length=False,
+            return_overflowing_tokens=False,
+            return_tensors="pt",
+        ).attention_mask
+        return text_mask.sum().item() - 1
+
 
