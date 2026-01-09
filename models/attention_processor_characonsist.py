@@ -442,12 +442,27 @@ def remove_small_holes_and_points(mask_tensor):
     n, h, w = mask_tensor.shape
     results = []
     for i in range(n):
-        mask = mask_tensor[i].cpu().numpy().astype(np.uint8)
-        kernel = np.ones((3, 3), np.uint8)
-        mask = cv2.erode(mask, kernel, iterations=1)
-        kernel = np.ones((5, 5), np.uint8)
-        mask = cv2.dilate(mask, kernel, iterations=1)
-        results.append(torch.tensor(mask))
+        mask_np = mask_tensor[i].cpu().numpy().astype(np.uint8)
+
+        # 自适应内核大小：基于图像尺寸的2%，最小3
+        kernel_size = max(3, int(min(h, w) * 0.02))
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+
+        # 开操作：去除小噪声同时保持主要结构
+        mask_np = cv2.morphologyEx(mask_np, cv2.MORPH_OPEN, kernel, iterations=1)
+
+        # 闭操作：填充小洞同时保持边界
+        mask_np = cv2.morphologyEx(mask_np, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+        # 连通组件分析：保留面积最大的连通区域
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask_np)
+        if num_labels > 1:  # 如果有多个连通区域
+            # 保留面积最大的组件（跳过背景标签0）
+            largest_label = np.argmax(stats[1:, cv2.CC_STAT_AREA]) + 1
+            mask_np = (labels == largest_label).astype(np.uint8)
+
+        results.append(torch.tensor(mask_np))
+
     results = torch.stack(results, dim=0).to(mask_tensor.device, dtype=mask_tensor.dtype)
     return results
 
@@ -470,7 +485,7 @@ def get_curr_fg_mask(pipe):
     # 自适应阈值选择：使用分位数而不是固定比较
     # quantile需要float/double类型，先转换
     fg_confidence_float = fg_confidence.float()
-    threshold = torch.quantile(fg_confidence_float, 0.65)  # 65%分位数作为阈值
+    threshold = torch.quantile(fg_confidence_float, 0.55)  # 65%分位数作为阈值
 
     mask = fg_confidence > threshold
     return remove_small_holes_and_points(mask)
