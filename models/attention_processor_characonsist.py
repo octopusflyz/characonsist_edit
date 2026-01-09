@@ -463,7 +463,17 @@ def get_curr_fg_mask(pipe):
             processor.attn_weights = dict()
     bg_attns = sum(all_attn_weights["bg"]) / len(all_attn_weights["bg"])
     fg_attns = sum(all_attn_weights["fg"]) / len(all_attn_weights["fg"])
-    return remove_small_holes_and_points(bg_attns <= fg_attns)
+
+    # 改进的阈值选择：使用前景置信度 + 自适应阈值
+    fg_confidence = fg_attns / (bg_attns + fg_attns + 1e-6)  # 前景置信度
+
+    # 自适应阈值选择：使用分位数而不是固定比较
+    # quantile需要float/double类型，先转换
+    fg_confidence_float = fg_confidence.float()
+    threshold = torch.quantile(fg_confidence_float, 0.65)  # 65%分位数作为阈值
+
+    mask = fg_confidence > threshold
+    return remove_small_holes_and_points(mask)
 
 def get_cross_sim(pipe):
     attn_processors = pipe.transformer.attn_processors

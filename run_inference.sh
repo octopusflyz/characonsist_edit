@@ -6,7 +6,7 @@
 INIT_MODE=2
 GPU_IDS="0 1"
 MODEL_PATH="/mnt/netdisk2/zhangyf/model/FLUX.1-dev"
-OUT_DIR="results/one_people_v1_ada_tome"
+OUT_DIR="results/one_people_v1_threshold_0.65"
 
 # Image settings
 HEIGHT=1024
@@ -20,7 +20,7 @@ BG_PROMPTS=(
     "in an arcade, flashing lights and game machines in the background,"
     "in a fantasy-themed park, castles and fairy tale characters in the background,"
 )
-FG_PROMPT="a American girl with long brown hair, wearing a blue dress, "
+FG_PROMPT="a American girl with long brown hair, wearing a blue dress and a white hat, "
 ACT_PROMPTS=(
     "riding a roller coaster, excited expression, front view"
     "playing an arcade game, focused expression, side view"
