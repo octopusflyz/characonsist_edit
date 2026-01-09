@@ -236,16 +236,31 @@ class CharaConsistAttnProcessor2_0:
         return saved_key, saved_value, attention_mask
     
     
-    def ada_tome(self, hidden_states, timestep_ind, alpha, id_fg_inds=None, curr_fg_inds=None, max_sim=None, **kwargs):
+    def ada_tome(self, hidden_states, timestep_ind, alpha, id_fg_inds=None, curr_fg_inds=None, max_sim=None, argmax_indices=None, **kwargs):
         id_hidden_states = self.id_attn_bank[timestep_ind]["attn_out"].to(hidden_states.device, non_blocking=True)
         vision_hidden_states = hidden_states[:, self.text_seq_len:, :]
-        matched_id_hidden_states = id_hidden_states[:, id_fg_inds]
+
+        if argmax_indices is not None and curr_fg_inds is not None:
+            # 使用语义匹配：curr_fg_inds中的像素对应argmax_indices中指定的ID图像位置
+            matched_id_positions = argmax_indices.flatten()[curr_fg_inds]  # 获取语义对应的ID图像位置
+            matched_id_hidden_states = id_hidden_states[:, matched_id_positions]
+        else:
+            # 降级到空间匹配（向后兼容）
+            matched_id_hidden_states = id_hidden_states[:, id_fg_inds] if id_fg_inds is not None else id_hidden_states[:, curr_fg_inds]
+
         matched_curr_hidden_states = vision_hidden_states[:, curr_fg_inds]
 
-        alpha_tensor = torch.ones_like(curr_fg_inds, dtype=torch.bfloat16)
+        # 使用与输入张量相同的dtype，避免类型不匹配
+        input_dtype = vision_hidden_states.dtype
+        alpha_tensor = torch.ones_like(curr_fg_inds, dtype=input_dtype, device=curr_fg_inds.device)
         alpha_tensor = alpha_tensor * alpha
-        sim_weight = max_sim.flatten()[curr_fg_inds]
-        alpha_tensor = alpha_tensor * sim_weight
+
+        if max_sim is not None:
+            sim_weight = max_sim.flatten()[curr_fg_inds]
+            # 使用sigmoid限制相似度权重在合理范围内
+            sim_weight = torch.sigmoid(sim_weight).to(input_dtype)
+            alpha_tensor = alpha_tensor * sim_weight
+
         alpha_tensor = alpha_tensor.view(1, -1, 1)
 
         new_matched_curr_hidden_states = (1 - alpha_tensor) * matched_curr_hidden_states + alpha_tensor * matched_id_hidden_states
