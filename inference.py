@@ -8,6 +8,8 @@ parser.add_argument("--out_dir", type=str, default="results")
 parser.add_argument("--use_interpolate", action='store_true')
 parser.add_argument("--share_bg", action='store_true')
 parser.add_argument("--save_mask", action='store_true')
+parser.add_argument("--save_point_match", action='store_true')
+parser.add_argument("--point_match_dir", type=str, default="")
 parser.add_argument("--height", type=int, default=1024)
 parser.add_argument("--width", type=int, default=1024)
 parser.add_argument("--seed", type=int, default=2025)
@@ -25,6 +27,7 @@ from models.attention_processor_characonsist import (
     reset_id_bank,
 )
 from models.pipeline_characonsist import CharaConsistPipeline
+from datetime import datetime
 
 
 def init_model_mode_0():
@@ -121,19 +124,39 @@ def overlay_mask_on_image(image, mask, color, output_path):
     Image.fromarray(out_img).save(output_path)
 
 
+def save_point_match_data(out_dir, payload, filename_suffix=""):
+    """Save point matching data for visualization"""
+    if not args.save_point_match:
+        return
+
+    point_match_dir = args.point_match_dir if args.point_match_dir else os.path.join(out_dir, "point_match_data")
+    os.makedirs(point_match_dir, exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    filename = f"fg_only_cache{timestamp}{filename_suffix}.pt"
+    filepath = os.path.join(point_match_dir, filename)
+
+    torch.save(payload, filepath)
+    print(f"Saved point match data to: {filepath}")
+
 if __name__ == "__main__":
     # Model Init
     pipe = MODEL_INIT_FUNCS[args.init_mode]()
     reset_attn_processor(pipe, size=(args.height//16, args.width//16))
     # Load prompts
     all_prompt_info = load_prompt_file(pipe, args.prompts_file)
-    
+
     pipe_kwargs = dict(
         height = args.height,
         width = args.width,
         use_interpolate = args.use_interpolate,
         share_bg = args.share_bg
     )
+
+    # Collect all prompts for metadata
+    all_bg_prompts = []
+    all_fg_prompts = []
+    all_act_prompts = []
 
     for prompt_ind, (prompts, bg_lens, real_lens) in enumerate(all_prompt_info):
         out_dir = os.path.join(args.out_dir, f"prompt_{prompt_ind}")
@@ -143,6 +166,18 @@ if __name__ == "__main__":
             os.makedirs(mask_out_dir, exist_ok=True)
         id_prompt = prompts[0]
         frm_prompts = prompts[1:]
+
+        # Parse prompts for metadata (assuming format: bg#fg#act)
+        if "#" in id_prompt:
+            bg_part, fg_part, act_part = id_prompt.split("#", 2)
+            all_bg_prompts.append(bg_part.strip())
+            all_fg_prompts.append(fg_part.strip())
+            all_act_prompts.append(act_part.strip())
+        else:
+            # Fallback if format is different
+            all_bg_prompts.append("")
+            all_fg_prompts.append("")
+            all_act_prompts.append(id_prompt)
 
         # ID Gen
         print("#" * 50)
@@ -155,18 +190,73 @@ if __name__ == "__main__":
         if args.save_mask:
             overlay_mask_on_image(id_images[0], id_fg_mask[0].cpu().numpy(), (255, 0, 0), f"{mask_out_dir}/id_mask.jpg")
 
+        # Initialize payload for this prompt set
+        payload = {
+            "id": {
+                "image": np.array(id_images[0]),
+                "mask": id_fg_mask[0].cpu().numpy(),
+                "prompt": id_prompt,
+                "bg_prompt": all_bg_prompts[-1],
+                "act_prompt": all_act_prompts[-1]
+            },
+            "frames": [],
+            "meta": {
+                "bg_prompts": all_bg_prompts,
+                "fg_prompt": all_fg_prompts[-1] if all_fg_prompts else "",
+                "act_prompts": all_act_prompts,
+                "height": args.height,
+                "width": args.width,
+                "seed": args.seed,
+                "model_path": args.model_path,
+                "use_interpolate": args.use_interpolate,
+                "share_bg": args.share_bg
+            }
+        }
+
         # Frame Gen
         spatial_kwargs = dict(id_fg_mask = id_fg_mask, id_bg_mask = ~id_fg_mask)
         print("#" * 50)
         print("Generating frame images ...")
-        for ind, prompt in enumerate(frm_prompts):    
+        for ind, prompt in enumerate(frm_prompts):
             set_text_len(pipe, bg_lens[1:][ind], real_lens[1:][ind])
+
+            # Parse frame prompt
+            if "#" in prompt:
+                bg_part, fg_part, act_part = prompt.split("#", 2)
+                frame_bg_prompt = bg_part.strip()
+                frame_act_prompt = act_part.strip()
+            else:
+                frame_bg_prompt = ""
+                frame_act_prompt = prompt
+
             pre_images, spatial_kwargs = pipe(
-                prompt, is_pre_run=True, generator = torch.Generator("cpu").manual_seed(args.seed), spatial_kwargs=spatial_kwargs, **pipe_kwargs) 
-            pre_images[0].save(f"{out_dir}/{ind}_pre.jpg")       
+                prompt, is_pre_run=True, generator = torch.Generator("cpu").manual_seed(args.seed), spatial_kwargs=spatial_kwargs, **pipe_kwargs)
+            pre_images[0].save(f"{out_dir}/{ind}_pre.jpg")
             images, spatial_kwargs = pipe(
                 prompt, generator = torch.Generator("cpu").manual_seed(args.seed), spatial_kwargs=spatial_kwargs, **pipe_kwargs)
             images[0].save(f"{out_dir}/{ind}.jpg")
             if args.save_mask:
                 overlay_mask_on_image(images[0], spatial_kwargs["curr_fg_mask"][0].cpu().numpy(), (255, 0, 0), f"{mask_out_dir}/{ind}_mask.jpg")
+
+            # Save frame data for visualization
+            frame_data = {
+                "index": ind,
+                "image": np.array(images[0]),
+                "mask": spatial_kwargs["curr_fg_mask"][0].cpu().numpy(),
+                "prompt": prompt,
+                "bg_prompt": frame_bg_prompt,
+                "act_prompt": frame_act_prompt
+            }
+
+            # Add point matching data if available
+            if "argmax_indices" in spatial_kwargs:
+                frame_data["argmax_indices"] = spatial_kwargs["argmax_indices"][0].cpu().to(torch.int64).numpy()
+            if "max_sim" in spatial_kwargs:
+                frame_data["max_sim"] = spatial_kwargs["max_sim"][0].cpu().to(torch.float32).numpy()
+
+            payload["frames"].append(frame_data)
+
+        # Save point match data for this prompt set
+        save_point_match_data(args.out_dir, payload, f"_prompt_{prompt_ind}")
+
         reset_id_bank(pipe)
