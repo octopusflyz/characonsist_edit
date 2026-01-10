@@ -476,7 +476,7 @@ def reset_attn_processor(pipe, size, fg_share_freq=2, bg_share_freq=1):
     print(f"{reset_num} layers have been reset")
 
 
-def set_text_len(pipe, bg_len, real_len, num_objects=None, object_token_ranges=None, fg_lengths=None):
+def set_text_len(pipe, bg_len, real_len, num_objects=None, object_token_ranges=None):
     """设置文本长度，支持多对象
 
     Args:
@@ -485,7 +485,6 @@ def set_text_len(pipe, bg_len, real_len, num_objects=None, object_token_ranges=N
         real_len: 总token长度
         num_objects: 对象数量（可选）
         object_token_ranges: 每个对象对应的token范围列表（可选）
-        fg_lengths: 每个前景对象的token长度列表（可选）
     """
     attn_processors = pipe.transformer.attn_processors
     reset_num = 0
@@ -498,8 +497,6 @@ def set_text_len(pipe, bg_len, real_len, num_objects=None, object_token_ranges=N
                 processor.num_objects = num_objects
             if object_token_ranges is not None:
                 processor.object_token_ranges = object_token_ranges
-            if fg_lengths is not None:
-                processor.fg_lengths = fg_lengths
             reset_num += 1
     print(f"{reset_num} layers' background and real text length have been reset to {bg_len} and {real_len}.")
     if num_objects and num_objects > 1:
@@ -571,16 +568,9 @@ def get_curr_fg_mask(pipe):
 
         # 为每个对象计算mask，然后合并（使用与get_multi_object_fg_masks相同的逻辑）
         # 收集所有对象的attention权重
-        # all_attn_weights["objects"] 是一个列表，每个元素是一个processor的所有对象权重
-        # 我们需要对每个对象位置聚合所有processor的权重
         all_obj_attns = []
         for obj_idx in range(num_objects):
-            # 从每个processor中获取第obj_idx个对象的权重
-            obj_attn_list = []
-            for processor_weights in all_attn_weights["objects"]:
-                if len(processor_weights) > obj_idx:
-                    obj_attn_list.append(processor_weights[obj_idx])
-
+            obj_attn_list = [obj_attns[obj_idx] for obj_attns in all_attn_weights["objects"] if len(obj_attns) > obj_idx]
             if len(obj_attn_list) > 0:
                 obj_attn = sum(obj_attn_list) / len(obj_attn_list)
                 # 确保obj_attn是2维的 [H, W]
@@ -651,8 +641,6 @@ def get_multi_object_fg_masks(pipe):
                 object_token_ranges = getattr(processor, 'object_token_ranges', None)
             break
 
-    print(f"Debug get_multi_object_fg_masks: num_objects={num_objects}, object_token_ranges={object_token_ranges}")
-
     if num_objects <= 1:
         # 单对象模式，返回单个mask
         return [get_curr_fg_mask(pipe)]
@@ -667,12 +655,6 @@ def get_multi_object_fg_masks(pipe):
                 all_attn_weights[k].append(saved_attns[k])
             processor.attn_weights = dict()
 
-    print(f"Debug: all_attn_weights keys: {list(all_attn_weights.keys())}")
-    if "objects" in all_attn_weights:
-        print(f"Debug: objects list length: {len(all_attn_weights['objects'])}")
-        if len(all_attn_weights['objects']) > 0:
-            print(f"Debug: first processor objects: {len(all_attn_weights['objects'][0])}")
-
     bg_attns = sum(all_attn_weights["bg"]) / len(all_attn_weights["bg"])
     # 确保bg_attns是2维的 [H, W]
     if len(bg_attns.shape) == 3:
@@ -680,20 +662,40 @@ def get_multi_object_fg_masks(pipe):
     elif len(bg_attns.shape) != 2:
         bg_attns = bg_attns.view(-1, bg_attns.shape[-2], bg_attns.shape[-1])[0]
 
-    # 两阶段多对象mask生成
-    object_masks = []
+    # 第一阶段：计算整体前景mask（与单对象逻辑相同）
+    # 计算所有对象的attention之和（等价于单对象的fg_attn）
+    overall_fg_attn_list = []
+    for processor_objects in all_attn_weights["objects"]:
+        if len(processor_objects) > 0:
+            # 将所有对象的attention相加
+            processor_fg_attn = sum(processor_objects)
+            overall_fg_attn_list.append(processor_fg_attn)
 
-    # 第一阶段：确定整体前景区域（所有对象attention vs 背景）
-    # 计算所有对象的attention之和
-    if "objects" in all_attn_weights and len(all_attn_weights["objects"]) > 0:
-        combined_obj_attn = None
+    if len(overall_fg_attn_list) > 0:
+        overall_fg_attn = sum(overall_fg_attn_list) / len(overall_fg_attn_list)
+        # 确保overall_fg_attn是2维的 [H, W]
+        if len(overall_fg_attn.shape) == 3:
+            overall_fg_attn = overall_fg_attn.squeeze(0)
+        elif len(overall_fg_attn.shape) != 2:
+            overall_fg_attn = overall_fg_attn.view(-1, overall_fg_attn.shape[-2], overall_fg_attn.shape[-1])[0]
+
+        # 使用置信度计算整体前景mask（与单对象逻辑相同）
+        fg_confidence = overall_fg_attn / (bg_attns + overall_fg_attn + 1e-6)
+        fg_confidence_float = fg_confidence.float()
+        overall_threshold = torch.quantile(fg_confidence_float, 0.55)
+        overall_fg_mask = fg_confidence > overall_threshold
+
+        # 应用形态学操作确保mask完整
+        if len(overall_fg_mask.shape) == 2:
+            overall_fg_mask = overall_fg_mask.unsqueeze(0)
+        overall_fg_mask = remove_small_holes_and_points(overall_fg_mask)
+        overall_fg_mask = overall_fg_mask.squeeze(0)
+
+        # 第二阶段：在前景区域内，对象间竞争分配
+        # 收集所有对象的attention权重
+        all_obj_attns = []
         for obj_idx in range(num_objects):
-            # 从每个processor中获取第obj_idx个对象的权重
-            obj_attn_list = []
-            for processor_weights in all_attn_weights["objects"]:
-                if len(processor_weights) > obj_idx:
-                    obj_attn_list.append(processor_weights[obj_idx])
-
+            obj_attn_list = [obj_attns[obj_idx] for obj_attns in all_attn_weights["objects"] if len(obj_attns) > obj_idx]
             if len(obj_attn_list) > 0:
                 obj_attn = sum(obj_attn_list) / len(obj_attn_list)
                 # 确保obj_attn是2维的 [H, W]
@@ -701,67 +703,38 @@ def get_multi_object_fg_masks(pipe):
                     obj_attn = obj_attn.squeeze(0)
                 elif len(obj_attn.shape) != 2:
                     obj_attn = obj_attn.view(-1, obj_attn.shape[-2], obj_attn.shape[-1])[0]
+                all_obj_attns.append(obj_attn)
+            else:
+                # 如果没有找到该对象的注意力权重，创建一个零tensor
+                all_obj_attns.append(torch.zeros_like(bg_attns))
 
-                if combined_obj_attn is None:
-                    combined_obj_attn = obj_attn
-                else:
-                    combined_obj_attn = combined_obj_attn + obj_attn
+        # 在前景区域内进行对象竞争
+        object_masks = []
+        if len(all_obj_attns) > 0:
+            # 将所有对象的attention堆叠起来 [num_objects, H, W]
+            stacked_obj_attns = torch.stack(all_obj_attns, dim=0)  # [num_objects, H, W]
 
-            # 使用置信度方法确定整体前景区域
-            if combined_obj_attn is not None:
-                fg_confidence = combined_obj_attn / (bg_attns + combined_obj_attn + 1e-6)
-                fg_confidence_float = fg_confidence.float()
-                overall_threshold = torch.quantile(fg_confidence_float, 0.55)
-                overall_fg_mask = fg_confidence > overall_threshold
-                # 确保mask有正确的维度 [1, H, W] 用于remove_small_holes_and_points
-                if len(overall_fg_mask.shape) == 2:
-                    overall_fg_mask = overall_fg_mask.unsqueeze(0)
-                overall_fg_mask = remove_small_holes_and_points(overall_fg_mask)
-                # 移除batch维度，返回 [H, W]
-                overall_fg_mask = overall_fg_mask.squeeze(0)
+            # 找到每个像素对应的最大attention的对象索引
+            max_obj_attn, max_obj_idx = torch.max(stacked_obj_attns, dim=0)  # [H, W]
 
-            # 第二阶段：在前景区域内，竞争性地分配给不同对象
-            # 收集所有对象的attention权重
-            all_obj_attns = []
+            # 为每个对象生成mask：只在前景区域内，该对象赢得竞争
             for obj_idx in range(num_objects):
-                obj_attn_list = [obj_attns[obj_idx] for obj_attns in all_attn_weights["objects"] if len(obj_attns) > obj_idx]
-                if len(obj_attn_list) > 0:
-                    obj_attn = sum(obj_attn_list) / len(obj_attn_list)
-                    # 确保obj_attn是2维的 [H, W]
-                    if len(obj_attn.shape) == 3:
-                        obj_attn = obj_attn.squeeze(0)
-                    elif len(obj_attn.shape) != 2:
-                        obj_attn = obj_attn.view(-1, obj_attn.shape[-2], obj_attn.shape[-1])[0]
-                    all_obj_attns.append(obj_attn)
-                else:
-                    # 如果没有找到该对象的注意力权重，创建一个零tensor
-                    all_obj_attns.append(torch.zeros_like(bg_attns))
+                # 该对象在该像素赢得竞争
+                obj_wins = (max_obj_idx == obj_idx)
+                # 只在整体前景区域内进行分配
+                obj_mask = obj_wins & overall_fg_mask
 
-            # 在前景区域内进行对象竞争
-            if len(all_obj_attns) > 0:
-                # 将所有对象的attention堆叠起来 [num_objects, H, W]
-                stacked_obj_attns = torch.stack(all_obj_attns, dim=0)  # [num_objects, H, W]
+                # 应用形态学操作确保mask完整
+                if len(obj_mask.shape) == 2:
+                    obj_mask = obj_mask.unsqueeze(0)
+                obj_mask = remove_small_holes_and_points(obj_mask)
+                object_masks.append(obj_mask.squeeze(0))
 
-                # 找到每个像素对应的最大attention的对象索引
-                max_obj_weights, max_obj_indices = torch.max(stacked_obj_attns, dim=0)
+    # 如果没有计算到overall_fg_mask，使用默认的单对象逻辑
+    if overall_fg_mask is None:
+        overall_fg_mask = get_curr_fg_mask(pipe)
 
-                # 为每个对象生成mask：只在前景区域内，该对象赢得竞争
-                for obj_idx in range(num_objects):
-                    # 该对象在该像素赢得竞争
-                    obj_wins = (max_obj_indices == obj_idx)
-                    # 只在整体前景区域内
-                    obj_mask = obj_wins & overall_fg_mask
-                    # 确保obj_mask是2维的 [H, W]，然后添加batch维度
-                    if len(obj_mask.shape) == 3:
-                        obj_mask = obj_mask.squeeze(0)  # 如果是 [1, H, W]，去掉第一个维度
-                    elif len(obj_mask.shape) != 2:
-                        # 如果不是2维，尝试reshape
-                        obj_mask = obj_mask.view(-1, obj_mask.shape[-2], obj_mask.shape[-1])[0]
-                    # 应用形态学操作
-                    obj_mask_processed = remove_small_holes_and_points(obj_mask.unsqueeze(0))
-                    object_masks.append(obj_mask_processed[0])
-
-    return object_masks if len(object_masks) > 0 else [get_curr_fg_mask(pipe)]
+    return overall_fg_mask, object_masks
 
 def get_cross_sim(pipe):
     attn_processors = pipe.transformer.attn_processors
@@ -796,7 +769,6 @@ def set_fg_lengths(pipe, fg_lengths):
         processor = attn_processors[name]
         if isinstance(processor, CharaConsistAttnProcessor2_0):
             processor.fg_lengths = fg_lengths
-
 def get_curr_fg_masks_two_stage(pipe, fg_lengths):
     """两阶段前景mask生成"""
     attn_processors = pipe.transformer.attn_processors
@@ -845,36 +817,27 @@ def get_curr_fg_masks_two_stage(pipe, fg_lengths):
 
     # 第二阶段：在前景区域内直接比较各对象权重，赢者通吃
     fg_masks = []
-    if "objects" in all_attn_weights and len(all_attn_weights["objects"]) > 0:
+    if isinstance(all_attn_weights["fg"][0], list):
         # 收集所有对象的注意力权重
         all_obj_attns = []
-        for obj_idx in range(num_objects):
-            obj_attn_list = [obj_attns[obj_idx] for obj_attns in all_attn_weights["objects"] if len(obj_attns) > obj_idx]
-            if len(obj_attn_list) > 0:
-                obj_attn = sum(obj_attn_list) / len(obj_attn_list)
-                # 确保obj_attn是2维的 [H, W]
-                if len(obj_attn.shape) == 3:
-                    obj_attn = obj_attn.squeeze(0)
-                elif len(obj_attn.shape) != 2:
-                    obj_attn = obj_attn.view(-1, obj_attn.shape[-2], obj_attn.shape[-1])[0]
-                all_obj_attns.append(obj_attn)
+        for i in range(len(fg_lengths)):
+            fg_attns_list = [attn[i].to(device) for attn in all_attn_weights["fg"]]
+            obj_attn = sum(fg_attns_list) / len(fg_attns_list)
+            all_obj_attns.append(obj_attn)
 
-        # 在前景区域内进行对象竞争
-        if len(all_obj_attns) > 0:
-            # 将所有对象权重堆叠起来 [num_objects, H, W]
-            stacked_obj_attns = torch.stack(all_obj_attns, dim=0)
+        # 将所有对象权重堆叠起来 [num_objects, H, W]
+        stacked_obj_attns = torch.stack(all_obj_attns, dim=0)
 
-            # 找到每个像素对应的最大attention的对象索引
-            max_obj_weights, max_obj_indices = torch.max(stacked_obj_attns, dim=0)
+        # 找到每个像素的最大权重对象
+        max_obj_weights, max_obj_indices = torch.max(stacked_obj_attns, dim=0)
 
-            # 为每个对象生成mask：只在前景区域内，该对象赢得竞争
-            for obj_idx in range(num_objects):
-                # 该对象在该像素赢得竞争
-                obj_wins = (max_obj_indices == obj_idx)
-                # 只在整体前景区域内
-                obj_mask = obj_wins & overall_fg_mask
-                # 应用形态学操作
-                fg_masks.append(remove_small_holes_and_points(obj_mask))
+        # 为每个对象生成mask：只在前景区域内，该对象赢得竞争
+        for obj_idx in range(len(fg_lengths)):
+            # 该对象在该像素赢得竞争
+            obj_wins = (max_obj_indices == obj_idx)
+            # 只在整体前景区域内
+            obj_mask = obj_wins & overall_fg_mask
+            fg_masks.append(remove_small_holes_and_points(obj_mask))
     else:
         # 单对象情况
         fg_masks = [overall_fg_mask]
@@ -886,3 +849,4 @@ def get_curr_fg_masks_two_stage(pipe, fg_lengths):
             processor.attn_weights = dict()
 
     return fg_masks
+

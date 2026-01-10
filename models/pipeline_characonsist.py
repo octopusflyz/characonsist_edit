@@ -238,26 +238,18 @@ class CharaConsistPipeline(FluxPipeline):
                     # 检查是否有多对象模式
                     # 通过检查processor的num_objects属性来判断
                     has_multi_objects = False
-                    print("Debug pipeline: checking for multi-objects")
                     for name in self.transformer.attn_processors:
                         processor = self.transformer.attn_processors[name]
-                        if hasattr(processor, 'num_objects'):
-                            print(f"Debug pipeline: processor {name} has num_objects={processor.num_objects}")
-                            if processor.num_objects > 1:
-                                has_multi_objects = True
-                                break
-                        else:
-                            print(f"Debug pipeline: processor {name} has no num_objects attr")
-                    print(f"Debug pipeline: has_multi_objects={has_multi_objects}")
+                        if hasattr(processor, 'num_objects') and processor.num_objects > 1:
+                            has_multi_objects = True
+                            break
 
                     if has_multi_objects:
-                        # 多对象模式：获取每个对象的独立mask
-                        print("Debug pipeline: calling get_multi_object_fg_masks")
-                        curr_fg_masks = get_multi_object_fg_masks(self)
-                        print(f"Debug pipeline: got {len(curr_fg_masks)} masks")
+                        # 多对象模式：获取整体前景mask和每个对象的独立mask
+                        overall_fg_mask, curr_fg_masks = get_multi_object_fg_masks(self)
                         spatial_kwargs["curr_fg_masks"] = curr_fg_masks
-                        # 为了向后兼容，第一个mask作为curr_fg_mask
-                        spatial_kwargs["curr_fg_mask"] = curr_fg_masks[0]
+                        # 设置整体前景mask
+                        spatial_kwargs["curr_fg_mask"] = overall_fg_mask
                         if update_bg:
                             # 对于多个mask，bg mask是所有fg mask的补集
                             combined_fg_mask = torch.zeros_like(curr_fg_masks[0])

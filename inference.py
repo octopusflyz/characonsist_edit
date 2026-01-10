@@ -113,9 +113,8 @@ def modify_prompt_and_get_length(bg, fg, act, pipe):
     bg_len = get_text_tokens_length(pipe, bg)
     real_len = get_text_tokens_length(pipe, prompt)
 
-    # 计算每个人物对应的 token 范围和长度
+    # 计算每个人物对应的 token 范围
     object_token_ranges = []
-    fg_lengths = []
     if num_objects > 1:
         for i, fg_part in enumerate(fg_parts):
             # 计算到当前人物为止的 prompt 长度
@@ -132,20 +131,17 @@ def modify_prompt_and_get_length(bg, fg, act, pipe):
                 start_token = get_text_tokens_length(pipe, prev_prompt_so_far)
 
             end_token = current_len
-            obj_length = end_token - start_token
             object_token_ranges.append((start_token, end_token))
-            fg_lengths.append(obj_length)
     else:
         # 单个人物的情况
-        fg_lengths = [real_len - bg_len]
         object_token_ranges = [(bg_len, real_len)]
 
-    return prompt, bg_len, real_len, num_objects, object_token_ranges, fg_lengths
+    return prompt, bg_len, real_len, num_objects, object_token_ranges
             
 def load_prompt_file(pipe, file_path):
     with open(file_path, "r") as f:
         all_lines = f.readlines()
-    all_prompt_info, curr_prompts, curr_bg_len, curr_real_len, curr_num_objects, curr_object_ranges, curr_fg_lengths = [], [], [], [], [], [], []
+    all_prompt_info, curr_prompts, curr_bg_len, curr_real_len, curr_num_objects, curr_object_ranges = [], [], [], [], [], []
     for line in all_lines:
         prompt = line.strip()
         if len(prompt) > 0:
@@ -155,18 +151,17 @@ def load_prompt_file(pipe, file_path):
                 bg = parts[0]
                 act = parts[-1]
                 fg = "#".join(parts[1:-1])  # 中间的都是fg描述
-                prompt, bg_len, real_len, num_objects, object_token_ranges, fg_lengths = modify_prompt_and_get_length(bg, fg, act, pipe)
+                prompt, bg_len, real_len, num_objects, object_token_ranges = modify_prompt_and_get_length(bg, fg, act, pipe)
                 curr_prompts.append(prompt)
                 curr_bg_len.append(bg_len)
                 curr_real_len.append(real_len)
                 curr_num_objects.append(num_objects)
                 curr_object_ranges.append(object_token_ranges)
-                curr_fg_lengths.append(fg_lengths)
         else:
-            all_prompt_info.append((curr_prompts, curr_bg_len, curr_real_len, curr_num_objects, curr_object_ranges, curr_fg_lengths))
-            curr_prompts, curr_bg_len, curr_real_len, curr_num_objects, curr_object_ranges, curr_fg_lengths = [], [], [], [], [], []
+            all_prompt_info.append((curr_prompts, curr_bg_len, curr_real_len, curr_num_objects, curr_object_ranges))
+            curr_prompts, curr_bg_len, curr_real_len, curr_num_objects, curr_object_ranges = [], [], [], [], []
     if len(curr_prompts) > 0:
-        all_prompt_info.append((curr_prompts, curr_bg_len, curr_real_len, curr_num_objects, curr_object_ranges, curr_fg_lengths))
+        all_prompt_info.append((curr_prompts, curr_bg_len, curr_real_len, curr_num_objects, curr_object_ranges))
     return all_prompt_info
 
 from PIL import Image
@@ -203,12 +198,13 @@ def overlay_mask_on_image(image, mask, color, output_path=None):
     return result_image
 
 
-def visualize_object_masks(image, object_masks, title="Object Masks", save_path=None):
+def visualize_object_masks(image, object_masks, overall_fg_mask=None, title="Object Masks", save_path=None):
     """
-    可视化每个对象的独立mask
+    可视化整体前景mask和每个对象的独立mask
     Args:
         image: PIL Image, 原始图像
         object_masks: list of torch.Tensor, 每个对象的mask列表
+        overall_fg_mask: torch.Tensor, optional, 整体前景mask
         title: str, 图表标题
         save_path: str, optional, 保存路径
     """
@@ -217,15 +213,46 @@ def visualize_object_masks(image, object_masks, title="Object Masks", save_path=
         return
 
     num_objects = len(object_masks)
-    fig, axes = plt.subplots(1, num_objects + 1, figsize=(5 * (num_objects + 1), 5))
+    num_cols = num_objects + 1  # 原始图像
+    if overall_fg_mask is not None:
+        num_cols += 1  # 增加整体前景mask列
+
+    fig, axes = plt.subplots(1, num_cols, figsize=(5 * num_cols, 5))
 
     # 显示原图
     axes[0].imshow(image)
     axes[0].set_title("Original Image")
     axes[0].axis('off')
 
-    # 为每个对象分配不同颜色
-    colors = [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0), (255, 0, 255), (0, 255, 255)]
+    col_idx = 1
+
+    # 显示整体前景mask
+    if overall_fg_mask is not None:
+        # 处理mask维度
+        if len(overall_fg_mask.shape) == 3:  # [B, H, W]
+            fg_mask = overall_fg_mask[0].cpu().numpy()
+        else:  # [H, W]
+            fg_mask = overall_fg_mask.cpu().numpy() if hasattr(overall_fg_mask, 'cpu') else overall_fg_mask
+
+        # 创建前景mask overlay (绿色)
+        img_array = np.array(image).astype(np.float32) * 0.5
+        mask_resized = Image.fromarray((fg_mask * 255).astype(np.uint8)).resize(image.size, Image.NEAREST)
+        mask_resized = np.array(mask_resized)
+        mask_resized = mask_resized[:, :, None] / 255.0
+
+        # 使用绿色显示前景mask
+        fg_color = np.array([0, 255, 0], dtype=np.float32).reshape(1, 1, -1)
+        mask_resized_color = mask_resized * fg_color
+        img_array = img_array + mask_resized_color * 0.5
+        img_array = np.clip(img_array, 0, 255).astype(np.uint8)
+
+        axes[col_idx].imshow(img_array)
+        axes[col_idx].set_title("Overall FG Mask")
+        axes[col_idx].axis('off')
+        col_idx += 1
+
+    # 为每个对象分配不同颜色（跳过绿色，因为用于前景mask）
+    colors = [(255, 0, 0), (0, 0, 255), (255, 255, 0), (255, 0, 255), (0, 255, 255)]
 
     # 显示每个对象的mask
     for obj_idx, obj_mask in enumerate(object_masks):
@@ -246,9 +273,10 @@ def visualize_object_masks(image, object_masks, title="Object Masks", save_path=
         img_array = img_array + mask_resized_color * 0.5
         img_array = np.clip(img_array, 0, 255).astype(np.uint8)
 
-        axes[obj_idx + 1].imshow(img_array)
-        axes[obj_idx + 1].set_title(f"Object {obj_idx + 1} Mask")
-        axes[obj_idx + 1].axis('off')
+        axes[col_idx].imshow(img_array)
+        axes[col_idx].set_title(f"Object {obj_idx + 1} Mask")
+        axes[col_idx].axis('off')
+        col_idx += 1
 
     plt.suptitle(title, fontsize=14)
     plt.tight_layout()
@@ -294,7 +322,7 @@ if __name__ == "__main__":
     all_fg_prompts = []
     all_act_prompts = []
 
-    for prompt_ind, (prompts, bg_lens, real_lens, num_objects_list, object_ranges_list, fg_lengths_list) in enumerate(all_prompt_info):
+    for prompt_ind, (prompts, bg_lens, real_lens, num_objects_list, object_ranges_list) in enumerate(all_prompt_info):
         out_dir = os.path.join(args.out_dir, f"prompt_{prompt_ind}")
         os.makedirs(out_dir, exist_ok=True)
         if args.save_mask:
@@ -318,8 +346,8 @@ if __name__ == "__main__":
         # ID Gen
         print("#" * 50)
         print("Generating ID image ...")
-        num_objects, object_token_ranges, fg_lengths = num_objects_list[0], object_ranges_list[0], fg_lengths_list[0]
-        set_text_len(pipe, bg_lens[0], real_lens[0], num_objects=num_objects, object_token_ranges=object_token_ranges, fg_lengths=fg_lengths)
+        num_objects, object_token_ranges = num_objects_list[0], object_ranges_list[0]
+        set_text_len(pipe, bg_lens[0], real_lens[0], num_objects=num_objects, object_token_ranges=object_token_ranges)
         id_images, id_spatial_kwargs = pipe(
             id_prompt, is_id=True, generator = torch.Generator("cpu").manual_seed(args.seed), **pipe_kwargs)
         id_fg_mask = id_spatial_kwargs["curr_fg_mask"]
@@ -331,6 +359,17 @@ if __name__ == "__main__":
 
         # 检查是否有多个对象mask，进行多对象可视化
         id_object_masks = id_spatial_kwargs.get("curr_fg_masks", None)
+        id_overall_fg_mask = id_spatial_kwargs.get("curr_fg_mask", None)
+
+        # 调试信息
+        print(f"Debug: id_object_masks is None: {id_object_masks is None}")
+        if id_object_masks is not None:
+            print(f"Debug: len(id_object_masks) = {len(id_object_masks)}")
+        print(f"Debug: id_overall_fg_mask is None: {id_overall_fg_mask is None}")
+        if id_overall_fg_mask is not None:
+            print(f"Debug: overall_fg_mask shape: {id_overall_fg_mask.shape}")
+            print(f"Debug: overall_fg_mask sum: {id_overall_fg_mask.sum().item() if hasattr(id_overall_fg_mask, 'sum') else 'N/A'}")
+
         if id_object_masks is not None and len(id_object_masks) > 1:
             print(f"Found {len(id_object_masks)} object masks for ID image")
             # 可视化多对象mask
@@ -339,7 +378,8 @@ if __name__ == "__main__":
                 visualize_object_masks(
                     id_images[0],
                     id_object_masks,
-                    title="ID Image - Individual Object Masks",
+                    overall_fg_mask=id_overall_fg_mask,
+                    title="ID Image - Overall FG + Individual Object Masks",
                     save_path=save_path
                 )
 
@@ -378,8 +418,8 @@ if __name__ == "__main__":
             print("#" * 50)
             print("Generating frame images ...")
             for ind, prompt in enumerate(frm_prompts):
-                frame_num_objects, frame_object_ranges, frame_fg_lengths = num_objects_list[1:][ind], object_ranges_list[1:][ind], fg_lengths_list[1:][ind]
-                set_text_len(pipe, bg_lens[1:][ind], real_lens[1:][ind], num_objects=frame_num_objects, object_token_ranges=frame_object_ranges, fg_lengths=frame_fg_lengths)
+                frame_num_objects, frame_object_ranges = num_objects_list[1:][ind], object_ranges_list[1:][ind]
+                set_text_len(pipe, bg_lens[1:][ind], real_lens[1:][ind], num_objects=frame_num_objects, object_token_ranges=frame_object_ranges)
 
                 # Parse frame prompt
                 if "#" in prompt:
@@ -403,6 +443,7 @@ if __name__ == "__main__":
 
                 # 检查是否有多个对象mask，进行多对象可视化
                 frame_object_masks = spatial_kwargs.get("curr_fg_masks", None)
+                frame_overall_fg_mask = spatial_kwargs.get("curr_fg_mask", None)
                 if frame_object_masks is not None and len(frame_object_masks) > 1:
                     print(f"Found {len(frame_object_masks)} object masks for frame {ind}")
                     # 可视化多对象mask
@@ -411,7 +452,8 @@ if __name__ == "__main__":
                         visualize_object_masks(
                             images[0],
                             frame_object_masks,
-                            title=f"Frame {ind} - Individual Object Masks",
+                            overall_fg_mask=frame_overall_fg_mask,
+                            title=f"Frame {ind} - Overall FG + Individual Object Masks",
                             save_path=save_path
                         )
 
