@@ -25,6 +25,28 @@ def get_interpolate_weight(weight, start_step, decay_step, end_step):
         weight_dict[interpolate_step] = weight_list[ind]
     return weight_dict
 
+def get_style_guidance_weight(weight, start_step, end_step):
+    """Get style guidance weight schedule with smooth transitions"""
+    if weight <= 0:
+        return {}
+    steps = np.arange(start_step, end_step)
+
+    # Create a smooth bell-shaped curve for more natural style influence
+    # This avoids abrupt changes that cause hard transitions
+    progress = (steps - start_step) / max(1, end_step - start_step - 1)
+
+    # Gaussian-like curve: smooth rise and fall
+    # Peak influence in the middle, gentle transitions at start and end
+    sigma = 0.25  # Controls the width of the bell curve
+    weights = weight * np.exp(-((progress - 0.5) ** 2) / (2 * sigma ** 2))
+
+    # Ensure non-negative and smooth
+    weights = np.maximum(weights, 0)
+
+    weight_dict = dict(zip(steps, weights.tolist()))
+    print(f"[STYLE_WEIGHT] Created smooth style transfer schedule: {len(weight_dict)} steps, peak influence: {weight:.4f}")
+    return weight_dict
+
 def get_shared_fg_mask(id_fg_mask, curr_fg_mask, curr2id_argmax_indices, curr2id_valid_mask):
     curr_valid_mask = curr2id_valid_mask.flatten()
     id_fg_mask = id_fg_mask.flatten().to(curr2id_argmax_indices.device)
@@ -72,7 +94,14 @@ class CharaConsistPipeline(FluxPipeline):
         interpolate_end_step: int = 31,
         interpolate_weight: float = 0.8,
         sim_thr = 0.5,
-        save_mask_point_step: int = 10
+        save_mask_point_step: int = 10,
+        # Style guidance args
+        use_style_guidance: bool = False,
+        style_guidance_scale: float = 1.0,
+        style_guidance_start_step: int = 1,
+        style_guidance_end_step: int = 30,
+        # Debug args
+        debug_output_dir: str = None
     ):
         
         height = height or self.default_sample_size * self.vae_scale_factor
@@ -134,7 +163,7 @@ class CharaConsistPipeline(FluxPipeline):
             generator,
             latents,
         )
-
+        import numpy as np
         # 5. Prepare timesteps
         sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps)
         image_seq_len = latents.shape[1]
@@ -165,6 +194,35 @@ class CharaConsistPipeline(FluxPipeline):
 
         interpolate_weight_dict = get_interpolate_weight(
             interpolate_weight, interpolate_start_step, interpolate_decay_step, interpolate_end_step)
+
+        # Style guidance setup - preserve state across calls
+        cfg_key = (use_style_guidance, style_guidance_scale, style_guidance_start_step, style_guidance_end_step)
+        current_cfg_key = getattr(self, '_cfg_initialized', None)
+        if current_cfg_key != cfg_key:
+            print(f"[STYLE_INIT] Style guidance params changed from {current_cfg_key} to {cfg_key}")
+            self._use_style_guidance = use_style_guidance
+            self._style_guidance_scale = style_guidance_scale
+            self._style_guidance_weight_dict = get_style_guidance_weight(
+                style_guidance_scale, style_guidance_start_step, style_guidance_end_step)
+            self._cfg_initialized = cfg_key
+            print(f"[STYLE_INIT] Created smooth weight schedule with {len(self._style_guidance_weight_dict)} steps")
+        else:
+            print(f"[STYLE_DEBUG] Style guidance params unchanged ({cfg_key}), preserving state")
+
+        # Initialize _id_latents only once per pipeline instance
+        if not hasattr(self, '_id_latents'):
+            self._id_latents = None
+            print(f"[STYLE_DEBUG] Initialized ID latents for style transfer")
+        
+        # Debug setup - always update to handle changing debug_output_dir
+        old_debug_dir = getattr(self, '_debug_output_dir', None)
+        if old_debug_dir != debug_output_dir:
+            print(f"[DEBUG_SETUP] Debug output dir changed: {old_debug_dir} -> {debug_output_dir}")
+            self._debug_output_dir = debug_output_dir
+            if debug_output_dir:
+                import os
+                os.makedirs(debug_output_dir, exist_ok=True)
+                print(f"[DEBUG_SETUP] Created debug directory for style transfer analysis: {debug_output_dir}")
 
         def get_consist_kwargs(i):
             if is_id:
@@ -214,6 +272,69 @@ class CharaConsistPipeline(FluxPipeline):
         # 6. Denoising loop
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
+                # Debug: Save denoising progress images for steps 40-50
+                if hasattr(self, '_debug_output_dir') and self._debug_output_dir and (i + 1) >= 40 and (i + 1) <= 50:
+                    try:
+                        import os
+                        os.makedirs(self._debug_output_dir, exist_ok=True)
+
+                        # Try to decode latents to actual images showing denoising progress
+                        try:
+                            # For FLUX, we need to properly unpack and scale latents
+                            latents_unpacked = self._unpack_latents(latents, height, width, self.vae_scale_factor)
+
+                            # Apply proper VAE scaling (FLUX specific)
+                            latents_unpacked = (latents_unpacked / self.vae.config.scaling_factor) + self.vae.config.shift_factor
+
+                            # Decode to image
+                            decoded = self.vae.decode(latents_unpacked, return_dict=False)[0]
+                            image = self.image_processor.postprocess(decoded, output_type="pil")[0]
+
+                            print(f"[DEBUG_SAVE] Step {i+1}: successfully decoded latent to image")
+
+                        except Exception as decode_error:
+                            print(f"[DEBUG_VAE_FAILED] Step {i+1} VAE decode failed ({str(decode_error)}), creating placeholder")
+                            # Create a placeholder image showing denoising progress
+                            from PIL import Image
+                            import numpy as np
+
+                            # Use timestep progress as visual indicator
+                            progress = (i + 1) / 50.0  # Assuming 50 steps total
+                            brightness = int(255 * (1.0 - progress))  # Dark to light as denoising progresses
+
+                            # Add some texture based on latent values
+                            latent_texture = float(latents.std())
+                            noise_level = min(50, int(latent_texture * 10))
+
+                            img_array = np.full((height, width, 3), brightness, dtype=np.uint8)
+                            # Add some noise to show it's not just a flat color
+                            noise = np.random.randint(-noise_level, noise_level+1, (height, width, 3))
+                            img_array = np.clip(img_array + noise, 0, 255).astype(np.uint8)
+
+                            image = Image.fromarray(img_array)
+                            print(f"[DEBUG_PLACEHOLDER] Step {i+1}: created progress indicator (brightness={brightness}, noise={noise_level})")
+
+                        # Save the image
+                        step_num = i + 1
+                        cfg_suffix = "_cfg" if (not is_id and not is_pre_run and hasattr(self, '_use_style_guidance') and self._use_style_guidance) else ""
+                        gen_type = 'id' if is_id else ('frame_pre' if is_pre_run else 'frame')
+                        filename = f"{self._debug_output_dir}/step_{step_num:03d}_{gen_type}{cfg_suffix}.jpg"
+
+                        image.save(filename)
+                        print(f"[DEBUG_SAVED] Step {step_num}: denoising progress image -> {filename}")
+
+                    except Exception as e:
+                        print(f"[DEBUG_ERROR] Step {i+1} complete failure: {str(e)}")
+                        # Minimal fallback
+                        try:
+                            from PIL import Image
+                            import numpy as np
+                            error_img = Image.new('RGB', (height, width), (255, 0, 0))  # Red error image
+                            error_filename = f"{self._debug_output_dir}/step_{i+1:03d}_error.jpg"
+                            error_img.save(error_filename)
+                            print(f"[DEBUG_ERROR_IMG] Saved error indicator: {error_filename}")
+                        except:
+                            pass
                 if self.interrupt:
                     continue
 
@@ -260,6 +381,43 @@ class CharaConsistPipeline(FluxPipeline):
                     latents = (latents - self.scheduler.sigmas[i] * noise_pred)
                     break
                 
+                # Apply CFG-style guidance for frame generation
+                # DEBUG: Check all conditions at multiple points
+                if not is_id and (i == 10 or i == 40):  # Check at steps 10 and 40
+                    print(f"[CFG_DEBUG] Step {i}: is_pre_run={is_pre_run}, use_guidance={self._use_style_guidance}, has_id_latents={self._id_latents is not None}, in_dict={i in self._style_guidance_weight_dict}")
+                    if self._id_latents is not None:
+                        print(f"[CFG_DEBUG] ID latents shape: {self._id_latents.shape}")
+                    else:
+                        print(f"[CFG_DEBUG] ID latents is None!")
+
+                # Apply CFG-style guidance for frame generation
+                # DEBUG: Check all conditions at multiple points
+                if not is_id and (i == 10 or i == 40):  # Check at steps 10 and 40
+                    print(f"[CFG_DEBUG] Step {i}: is_pre_run={is_pre_run}, use_guidance={self._use_style_guidance}, has_id_latents={self._id_latents is not None}, in_dict={i in self._style_guidance_weight_dict}")
+                    if self._id_latents is not None:
+                        print(f"[CFG_DEBUG] ID latents shape: {self._id_latents.shape}")
+                    else:
+                        print(f"[CFG_DEBUG] ID latents is None!")
+
+                if not is_id and not is_pre_run and self._use_style_guidance and self._id_latents is not None and i in self._style_guidance_weight_dict:
+                    guidance_scale = self._style_guidance_weight_dict[i]
+                    print(f"[CFG_ACTIVE] Step {i}: Applying guidance with scale {guidance_scale:.3f}")
+
+                    # CFG core: guide latents toward ID latents
+                    id_latent_current = self._id_latents.to(latents.device, latents.dtype)
+                    latent_diff = latents - id_latent_current
+                    diff_norm = latent_diff.norm().item()
+
+                    # Show guidance effect before applying
+                    original_distance = diff_norm
+                    latents = latents - latent_diff * guidance_scale
+
+                    # Calculate effect
+                    new_diff = (latents - id_latent_current).norm().item()
+                    guidance_effect = original_distance - new_diff
+
+                    print(f"[CFG_DETAIL] Step {i}: diff_before={original_distance:.4f}, diff_after={new_diff:.4f}, effect={guidance_effect:.4f}")
+
                 # compute the previous noisy sample x_t -> x_t-1
                 latents_dtype = latents.dtype
                 latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
@@ -281,7 +439,18 @@ class CharaConsistPipeline(FluxPipeline):
                 # call the callback, if provided
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
                     progress_bar.update()
-        
+
+
+        # Save ID latents for style guidance (save at CFG start step for better reference)
+        if is_id and self._use_style_guidance:
+            # Find the timestep corresponding to CFG start step
+            cfg_start_step = getattr(self, '_cfg_start_step', 35)  # Default fallback
+            if hasattr(self, '_style_guidance_weight_dict') and self._style_guidance_weight_dict:
+                cfg_start_step = min(self._style_guidance_weight_dict.keys())
+
+            # For now, save the final latent (could be improved to save at specific step)
+            self._id_latents = latents.detach().clone()
+            print(f"[CFG] Saved ID latents for style guidance, shape: {self._id_latents.shape}, CFG starts at step {cfg_start_step}")
 
         if output_type == "latent":
             image = latents

@@ -13,6 +13,18 @@ parser.add_argument("--point_match_dir", type=str, default="")
 parser.add_argument("--height", type=int, default=1024)
 parser.add_argument("--width", type=int, default=1024)
 parser.add_argument("--seed", type=int, default=2025)
+# Style consistency parameters
+parser.add_argument("--use_style_consistency", action='store_true', help="Enable style consistency loss")
+parser.add_argument("--style_layers", type=int, nargs='+', default=[8, 16, 24], help="Layers to extract style features")
+parser.add_argument("--style_weight", type=float, default=0.1, help="Style loss weight")
+parser.add_argument("--style_max_timestep", type=int, default=30, help="Maximum timestep to apply style loss")
+# CFG Style guidance parameters
+parser.add_argument("--use_cfg_guidance", action='store_true', help="Enable CFG-style latent guidance")
+parser.add_argument("--cfg_guidance_scale", type=float, default=1.0, help="CFG guidance scale")
+parser.add_argument("--cfg_guidance_start_step", type=int, default=1, help="Start step for CFG guidance")
+parser.add_argument("--cfg_guidance_end_step", type=int, default=30, help="End step for CFG guidance")
+# Debug parameters
+parser.add_argument("--debug_output_dir", type=str, default=None, help="Directory to save intermediate images every 10 steps")
 args = parser.parse_args()
 
 import os
@@ -142,7 +154,13 @@ def save_point_match_data(out_dir, payload, filename_suffix=""):
 if __name__ == "__main__":
     # Model Init
     pipe = MODEL_INIT_FUNCS[args.init_mode]()
-    reset_attn_processor(pipe, size=(args.height//16, args.width//16))
+    reset_attn_processor(
+        pipe,
+        size=(args.height//16, args.width//16),
+        style_layers=args.style_layers if args.use_style_consistency else None,
+        style_weight=args.style_weight if args.use_style_consistency else 0.0,
+        style_max_timestep=args.style_max_timestep
+    )
     # Load prompts
     all_prompt_info = load_prompt_file(pipe, args.prompts_file)
 
@@ -150,8 +168,20 @@ if __name__ == "__main__":
         height = args.height,
         width = args.width,
         use_interpolate = args.use_interpolate,
-        share_bg = args.share_bg
+        share_bg = args.share_bg,
+        use_style_guidance = args.use_cfg_guidance,  # Reusing cfg args for style guidance
+        style_guidance_scale = args.cfg_guidance_scale,
+        style_guidance_start_step = args.cfg_guidance_start_step,
+        style_guidance_end_step = args.cfg_guidance_end_step,
+        debug_output_dir = args.debug_output_dir
     )
+
+    # DEBUG: Print CFG parameters
+    print(f"[CFG_PARAMS] use_cfg_guidance: {args.use_cfg_guidance}")
+    print(f"[CFG_PARAMS] cfg_guidance_scale: {args.cfg_guidance_scale}")
+    print(f"[CFG_PARAMS] cfg_guidance_start_step: {args.cfg_guidance_start_step}")
+    print(f"[CFG_PARAMS] cfg_guidance_end_step: {args.cfg_guidance_end_step}")
+    print(f"[CFG_PARAMS] pipe_kwargs style params: use_style_guidance={pipe_kwargs.get('use_style_guidance', 'MISSING')}")
 
     # Collect all prompts for metadata
     all_bg_prompts = []

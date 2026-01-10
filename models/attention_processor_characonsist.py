@@ -15,6 +15,41 @@ from diffusers.models.embeddings import apply_rotary_emb
 from tqdm import tqdm
 
 
+def compute_gram_matrix(feature_map, mask=None):
+    """
+    Compute Gram matrix for style representation.
+
+    Args:
+        feature_map: Feature map tensor of shape (batch, seq_len, channels)
+        mask: Optional foreground mask to compute style only on foreground regions
+
+    Returns:
+        Gram matrix tensor
+    """
+    batch_size, seq_len, channels = feature_map.shape
+
+    # Reshape to (batch, channels, seq_len) for matrix multiplication
+    features = feature_map.permute(0, 2, 1)  # (batch, channels, seq_len)
+
+    if mask is not None:
+        # Apply mask to foreground regions only
+        mask = mask.view(batch_size, 1, seq_len).float()  # (batch, 1, seq_len)
+        # Normalize by the number of valid (foreground) positions
+        num_valid = mask.sum(dim=-1, keepdim=True) + 1e-8  # (batch, 1)
+        features = features * mask  # Zero out background
+    else:
+        num_valid = torch.tensor(seq_len, dtype=features.dtype, device=features.device).view(1, 1)
+
+    # Compute Gram matrix: (batch, channels, seq_len) @ (batch, seq_len, channels) -> (batch, channels, channels)
+    gram = torch.bmm(features, features.transpose(1, 2))
+
+    # Normalize by the number of elements (channels * spatial locations)
+    # For masked regions, normalize by the number of valid positions
+    gram = gram / (channels * num_valid)
+
+    return gram
+
+
 class FluxAttnProcessor2_0:
     """Attention processor used typically in processing the SD3-like self-attention projections."""
 
@@ -125,15 +160,25 @@ class CharaConsistAttnProcessor2_0:
         # Attention Share
         fg_share_flag=False,
         bg_share_flag=False,
+        # Style consistency
+        style_layers=None,  # List of layer indices to extract style features
+        style_weight=0.0,
+        style_decay=True,
+        style_max_timestep=30,  # Maximum timestep to apply style loss
     ):
         if not hasattr(F, "scaled_dot_product_attention"):
             raise ImportError("FluxAttnProcessor2_0 requires PyTorch 2.0, to use it, please upgrade PyTorch to 2.0.")
-        
+
         self.text_seq_len = text_seq_len
         self.visual_seq_len = size[0] * size[1]
         # Hyper Params
         self.fg_share_flag = fg_share_flag
         self.bg_share_flag = bg_share_flag
+        # Style consistency
+        self.style_layers = style_layers or []  # Default empty list
+        self.style_weight = style_weight
+        self.style_decay = style_decay
+        self.style_max_timestep = style_max_timestep
         # Sample Info
         self.bg_len = 0
         self.real_len = 0
@@ -142,6 +187,9 @@ class CharaConsistAttnProcessor2_0:
         self.id_attn_bank = dict()
         self.attn_weights = dict()
         self.cross_sims = None
+        # Style consistency storage
+        self.style_grams = dict()  # Store Gram matrices from ID image
+        self.id_fg_mask_for_style = None  # Store ID foreground mask for style masking
             
     def get_curr_attn_weights(self, q, k):
         attn_weights = torch.matmul(q[:, :, self.text_seq_len:], k[:, :, :self.real_len].transpose(-2, -1)).to(torch.float16)
@@ -268,6 +316,63 @@ class CharaConsistAttnProcessor2_0:
         out_hidden_states = torch.cat((hidden_states[:, :self.text_seq_len, :], vision_hidden_states), dim=-2)
         return out_hidden_states
 
+    def compute_style_loss(self, current_features, timestep_ind, fg_mask=None):
+        """
+        Compute style loss between current features and stored ID features.
+
+        Args:
+            current_features: Current vision features (batch, seq_len, channels)
+            timestep_ind: Current timestep index
+            fg_mask: Optional foreground mask for local style loss
+
+        Returns:
+            Style loss gradient tensor
+        """
+        if timestep_ind not in self.style_grams or self.style_weight <= 0:
+            return None
+
+        # Get stored Gram matrix from ID image
+        id_gram = self.style_grams[timestep_ind].to(current_features.device, dtype=current_features.dtype)
+
+        # Compute Gram matrix for current features
+        if fg_mask is not None and self.id_fg_mask_for_style is not None:
+            # Use foreground mask for local style consistency
+            fg_mask = fg_mask.flatten().unsqueeze(0)  # (1, seq_len)
+            current_gram = compute_gram_matrix(current_features, fg_mask)
+        else:
+            current_gram = compute_gram_matrix(current_features)
+
+        # Compute style loss (MSE between Gram matrices)
+        style_loss = F.mse_loss(current_gram, id_gram)
+
+        # Compute gradient w.r.t. features for style consistency
+        # We want to minimize ||G_current - G_target||², so gradient direction should be -(G_current - G_target)
+        # This will push current features towards the style of target features
+        gram_diff = (current_gram - id_gram)  # (batch, channels, channels)
+
+        # Convert back to feature space gradient
+        # For Gram matrix G = F^T F, ∂L/∂F ∝ F * ∂L/∂G
+        batch_size, seq_len, channels = current_features.shape
+        features_reshaped = current_features.permute(0, 2, 1)  # (batch, channels, seq_len)
+
+        # Compute gradient: ∂L/∂F = 2 * F * ∂L/∂G
+        # But we want the direction that reduces the loss, so we use -gradient
+        grad_wrt_features = torch.bmm(gram_diff, features_reshaped) * 2.0  # (batch, channels, seq_len)
+        grad_features = grad_wrt_features.permute(0, 2, 1)  # (batch, seq_len, channels)
+
+        # Apply foreground mask if provided
+        if fg_mask is not None:
+            grad_features = grad_features * fg_mask.unsqueeze(-1)
+
+        # Apply style weight and optional decay
+        current_weight = self.style_weight
+        if self.style_decay and timestep_ind > 10:
+            # Linear decay from timestep 10 to style_max_timestep
+            decay_factor = max(0.1, 1.0 - (timestep_ind - 10) / (self.style_max_timestep - 10))
+            current_weight *= decay_factor
+
+        return grad_features * current_weight
+
 
     def __call__(
         self,
@@ -292,6 +397,17 @@ class CharaConsistAttnProcessor2_0:
         **kwargs,
     ) -> torch.FloatTensor:
         batch_size, _, _ = hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
+
+        # Debug: Log key parameters at the start of each call (only once per run)
+        if timestep_ind == 0 and not hasattr(self, '_debug_logged'):
+            layer_ind = int(attn.name.split('.')[1]) if hasattr(attn, 'name') else 0
+            print(f"[DEBUG] Layer {layer_ind}: style_weight={self.style_weight}, style_layers={self.style_layers}, len(style_grams)={len(self.style_grams)}")
+            self._debug_logged = True
+
+        # Debug: Log when style guidance is available
+        if not save_attn_out_for_sim and self.style_weight > 0 and len(self.style_grams) > 0 and timestep_ind == 0:
+            layer_ind = int(attn.name.split('.')[-1]) if hasattr(attn, 'name') else 0
+            print(f"[STYLE] Frame generation with style guidance available: layer={layer_ind}, style_grams={len(self.style_grams)}")
 
         # `sample` projections.
         query = attn.to_q(hidden_states)
@@ -378,6 +494,25 @@ class CharaConsistAttnProcessor2_0:
             if timestep_ind not in self.id_attn_bank:
                 self.id_attn_bank[timestep_ind] = dict()
             self.id_attn_bank[timestep_ind]["attn_out"] = hidden_states[:, self.text_seq_len:, :].cpu()
+
+            # Save style features for style consistency (only for ID image)
+            if self.style_weight > 0 and len(self.style_layers) > 0:
+                # Check if this layer should extract style features
+                layer_ind = int(attn.name.split('.')[1]) if hasattr(attn, 'name') else 0
+                if layer_ind in self.style_layers:
+                    vision_features = hidden_states[:, self.text_seq_len:, :]  # (batch, seq_len, channels)
+                    # Use foreground mask if available for style computation
+                    fg_mask = spatial_kwargs.get("id_fg_mask") if spatial_kwargs else None
+                    if fg_mask is not None:
+                        fg_mask = fg_mask.flatten()  # Flatten to match sequence dimension
+                        self.id_fg_mask_for_style = fg_mask.cpu()
+                        gram_matrix = compute_gram_matrix(vision_features, fg_mask.unsqueeze(0))
+                    else:
+                        gram_matrix = compute_gram_matrix(vision_features)
+
+                    self.style_grams[timestep_ind] = gram_matrix.cpu()
+                    print(f"[ID] Saved style Gram matrix for layer {layer_ind}, timestep {timestep_ind}, shape: {gram_matrix.shape}")
+
         elif save_attn_out_for_interpolate and self.fg_share_flag:
             if timestep_ind not in self.id_attn_bank:
                 self.id_attn_bank[timestep_ind] = dict()
@@ -389,6 +524,9 @@ class CharaConsistAttnProcessor2_0:
         if attn_out_interpolate:
             if fg_share_flag:
                 hidden_states = self.ada_tome(hidden_states, timestep_ind, interpolate_weight_dict[timestep_ind], **spatial_kwargs)
+
+        # Style guidance is now handled at the latent level in the pipeline using CFG approach
+        # The attention processor focus remains on content consistency
 
         if encoder_hidden_states is not None:
             encoder_hidden_states, hidden_states = (
@@ -406,7 +544,7 @@ class CharaConsistAttnProcessor2_0:
             return hidden_states
 
 
-def reset_attn_processor(pipe, size, fg_share_freq=2, bg_share_freq=1):
+def reset_attn_processor(pipe, size, fg_share_freq=2, bg_share_freq=1, style_layers=None, style_weight=0.0, style_decay=True, style_max_timestep=30):
     new_attn_processors = dict()
     transformer = pipe.transformer
     ori_attn_processors = transformer.attn_processors
@@ -418,6 +556,10 @@ def reset_attn_processor(pipe, size, fg_share_freq=2, bg_share_freq=1):
                 size=size,
                 fg_share_flag=(block_ind % fg_share_freq == 0),
                 bg_share_flag=(block_ind % bg_share_freq == 0),
+                style_layers=style_layers,
+                style_weight=style_weight,
+                style_decay=style_decay,
+                style_max_timestep=style_max_timestep,
             )
             print(f"reset attn processor of layer {name}")
             reset_num += 1
