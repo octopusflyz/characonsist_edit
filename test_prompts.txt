@@ -1,0 +1,5 @@
+# Test prompt for progressive style guidance
+A cartoon character with blue hair#A cartoon character with blue hair#standing in a park
+
+# Second test
+A realistic portrait of a person#A realistic portrait of a person#sitting on a bench

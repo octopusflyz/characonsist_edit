@@ -19,9 +19,12 @@ STYLE_LAYERS="8"
 STYLE_WEIGHT=100
 STYLE_MAX_TIMESTEP=30
 
-# CFG guidance settings
+# Progressive Style Guidance settings
 USE_CFG_GUIDANCE=true
 CFG_GUIDANCE_SCALE=0.1   # Gentle influence for style guidance
+CFG_GUIDANCE_START_SIGMA=0.8    # Start when noise is moderate
+CFG_GUIDANCE_END_SIGMA=0.2      # End before details finalize
+# Legacy parameters (kept for compatibility)
 CFG_GUIDANCE_START_STEP=40
 CFG_GUIDANCE_END_STEP=51
 
@@ -77,6 +80,8 @@ python inference.py \
     --cfg_guidance_scale $CFG_GUIDANCE_SCALE \
     --cfg_guidance_start_step $CFG_GUIDANCE_START_STEP \
     --cfg_guidance_end_step $CFG_GUIDANCE_END_STEP \
+    --cfg_guidance_start_sigma $CFG_GUIDANCE_START_SIGMA \
+    --cfg_guidance_end_sigma $CFG_GUIDANCE_END_SIGMA \
     --debug_output_dir "$DEBUG_OUTPUT_DIR"
 
 # Save prompts info for visualization
@@ -106,6 +111,8 @@ Configuration:
 - Style Max Timestep: ${STYLE_MAX_TIMESTEP:-N/A}
 - CFG Guidance: ${USE_CFG_GUIDANCE:-No}
 - CFG Scale: ${CFG_GUIDANCE_SCALE:-N/A}
+- CFG Start Sigma: ${CFG_GUIDANCE_START_SIGMA:-N/A}
+- CFG End Sigma: ${CFG_GUIDANCE_END_SIGMA:-N/A}
 - CFG Start Step: ${CFG_GUIDANCE_START_STEP:-N/A}
 - CFG End Step: ${CFG_GUIDANCE_END_STEP:-N/A}
 EOF

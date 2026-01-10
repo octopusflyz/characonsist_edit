@@ -18,11 +18,13 @@ parser.add_argument("--use_style_consistency", action='store_true', help="Enable
 parser.add_argument("--style_layers", type=int, nargs='+', default=[8, 16, 24], help="Layers to extract style features")
 parser.add_argument("--style_weight", type=float, default=0.1, help="Style loss weight")
 parser.add_argument("--style_max_timestep", type=int, default=30, help="Maximum timestep to apply style loss")
-# CFG Style guidance parameters
-parser.add_argument("--use_cfg_guidance", action='store_true', help="Enable CFG-style latent guidance")
-parser.add_argument("--cfg_guidance_scale", type=float, default=1.0, help="CFG guidance scale")
-parser.add_argument("--cfg_guidance_start_step", type=int, default=1, help="Start step for CFG guidance")
-parser.add_argument("--cfg_guidance_end_step", type=int, default=30, help="End step for CFG guidance")
+# Progressive Style guidance parameters
+parser.add_argument("--use_cfg_guidance", action='store_true', help="Enable progressive style guidance")
+parser.add_argument("--cfg_guidance_scale", type=float, default=0.3, help="Overall style guidance scale")
+parser.add_argument("--cfg_guidance_start_step", type=int, default=1, help="Start step for style guidance (legacy)")
+parser.add_argument("--cfg_guidance_end_step", type=int, default=30, help="End step for style guidance (legacy)")
+parser.add_argument("--cfg_guidance_start_sigma", type=float, default=0.9, help="Start sigma for progressive style guidance")
+parser.add_argument("--cfg_guidance_end_sigma", type=float, default=0.1, help="End sigma for progressive style guidance")
 # Debug parameters
 parser.add_argument("--debug_output_dir", type=str, default=None, help="Directory to save intermediate images every 10 steps")
 args = parser.parse_args()
@@ -173,15 +175,17 @@ if __name__ == "__main__":
         style_guidance_scale = args.cfg_guidance_scale,
         style_guidance_start_step = args.cfg_guidance_start_step,
         style_guidance_end_step = args.cfg_guidance_end_step,
+        style_guidance_start_sigma = args.cfg_guidance_start_sigma,
+        style_guidance_end_sigma = args.cfg_guidance_end_sigma,
         debug_output_dir = args.debug_output_dir
     )
 
-    # DEBUG: Print CFG parameters
-    print(f"[CFG_PARAMS] use_cfg_guidance: {args.use_cfg_guidance}")
-    print(f"[CFG_PARAMS] cfg_guidance_scale: {args.cfg_guidance_scale}")
-    print(f"[CFG_PARAMS] cfg_guidance_start_step: {args.cfg_guidance_start_step}")
-    print(f"[CFG_PARAMS] cfg_guidance_end_step: {args.cfg_guidance_end_step}")
-    print(f"[CFG_PARAMS] pipe_kwargs style params: use_style_guidance={pipe_kwargs.get('use_style_guidance', 'MISSING')}")
+    # DEBUG: Print Progressive Style Guidance parameters
+    print(f"[STYLE_PARAMS] use_cfg_guidance: {args.use_cfg_guidance}")
+    print(f"[STYLE_PARAMS] cfg_guidance_scale: {args.cfg_guidance_scale}")
+    print(f"[STYLE_PARAMS] cfg_guidance_start_sigma: {args.cfg_guidance_start_sigma}")
+    print(f"[STYLE_PARAMS] cfg_guidance_end_sigma: {args.cfg_guidance_end_sigma}")
+    print(f"[STYLE_PARAMS] pipe_kwargs style params: use_style_guidance={pipe_kwargs.get('use_style_guidance', 'MISSING')}")
 
     # Collect all prompts for metadata
     all_bg_prompts = []

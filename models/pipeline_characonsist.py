@@ -4,6 +4,7 @@ from typing import Any, Callable, Dict, List, Optional, Union
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 import copy
 
 from diffusers import FluxPipeline
@@ -46,6 +47,183 @@ def get_style_guidance_weight(weight, start_step, end_step):
     weight_dict = dict(zip(steps, weights.tolist()))
     print(f"[STYLE_WEIGHT] Created smooth style transfer schedule: {len(weight_dict)} steps, peak influence: {weight:.4f}")
     return weight_dict
+
+
+def compute_global_style_statistics(latents, fg_mask=None):
+    """
+    Compute global style statistics (mean, std) for FLUX latents with foreground masking
+
+    Args:
+        latents: FLUX latent tensor of shape (batch, channels, height, width)
+        fg_mask: Optional foreground mask of shape (batch, 1, height, width)
+
+    Returns:
+        mean, std: Global statistics for each channel
+    """
+    if fg_mask is not None:
+        # Apply foreground mask - reshape to match latent dimensions
+        if fg_mask.dim() == 3:  # (batch, height, width)
+            fg_mask = fg_mask.unsqueeze(1)  # Add channel dimension -> (batch, 1, height, width)
+        fg_mask = F.interpolate(fg_mask.float(), size=latents.shape[-2:], mode='nearest')
+        masked_latents = latents * fg_mask
+
+        # Compute statistics only on foreground regions
+        valid_pixels = fg_mask.sum(dim=[1, 2, 3], keepdim=True) + 1e-8
+        mean = masked_latents.sum(dim=[2, 3], keepdim=True) / valid_pixels
+        var = ((masked_latents - mean) ** 2 * fg_mask).sum(dim=[2, 3], keepdim=True) / valid_pixels
+        std = torch.sqrt(var + 1e-8)
+    else:
+        # Global statistics across entire latent
+        mean = latents.mean(dim=[2, 3], keepdim=True)
+        std = latents.std(dim=[2, 3], keepdim=True) + 1e-8
+
+    return mean, std
+
+
+def compute_local_texture_grams(latents, fg_mask=None, patch_size=8):
+    """
+    Compute local texture statistics using Gram matrices on patches
+
+    Args:
+        latents: FLUX latent tensor of shape (batch, channels, height, width)
+        fg_mask: Optional foreground mask
+        patch_size: Size of patches for local texture analysis
+
+    Returns:
+        gram_matrices: Local Gram matrices for texture matching
+    """
+    batch, channels, height, width = latents.shape
+
+    # Ensure patch size doesn't exceed spatial dimensions
+    patch_size = min(patch_size, height, width)
+
+    # Extract patches using unfold
+    patches = F.unfold(latents, kernel_size=patch_size, stride=patch_size//2)
+    patches = patches.view(batch, channels, patch_size*patch_size, -1)
+    patches = patches.permute(0, 3, 1, 2)  # (batch, num_patches, channels, patch_size^2)
+
+    if fg_mask is not None:
+        # Apply foreground mask to patches - ensure correct shape
+        if fg_mask.dim() == 3:  # (batch, height, width)
+            fg_mask = fg_mask.unsqueeze(1)  # Add channel dimension -> (batch, 1, height, width)
+        fg_mask = F.interpolate(fg_mask.float(), size=latents.shape[-2:], mode='nearest')
+        fg_mask_patches = F.unfold(fg_mask, kernel_size=patch_size, stride=patch_size//2)
+        fg_mask_patches = fg_mask_patches.view(batch, 1, patch_size*patch_size, -1)
+        fg_mask_patches = fg_mask_patches.permute(0, 3, 1, 2)
+        patches = patches * fg_mask_patches
+
+    # Compute Gram matrices for each patch
+    grams = []
+    num_patches = patches.shape[1]
+
+    for patch_idx in range(min(num_patches, 64)):  # Limit to avoid memory issues
+        patch = patches[:, patch_idx]  # (batch, channels, patch_size^2)
+        if fg_mask is not None:
+            # Only compute Gram if patch has foreground content
+            fg_pixels = fg_mask_patches[:, patch_idx].sum(dim=[1, 2])
+            if fg_pixels.mean() > 0.1:  # At least 10% foreground pixels
+                gram = torch.bmm(patch, patch.transpose(1, 2)) / (channels * patch_size * patch_size)
+                grams.append(gram)
+        else:
+            gram = torch.bmm(patch, patch.transpose(1, 2)) / (channels * patch_size * patch_size)
+            grams.append(gram)
+
+    if len(grams) == 0:
+        return None
+
+    return torch.stack(grams, dim=1)  # (batch, num_valid_patches, channels, channels)
+
+
+def apply_progressive_style_guidance(latents, id_latents, fg_mask, current_sigma, guidance_scale=1.0):
+    """
+    Apply progressive style guidance based on sigma (noise level) in FLUX
+
+    Args:
+        latents: Current frame latents to be styled
+        id_latents: ID latents providing style reference
+        fg_mask: Foreground mask to constrain style application
+        current_sigma: Current noise level (0-1, higher = more noise)
+        guidance_scale: Overall strength of style guidance
+
+    Returns:
+        styled_latents: Latents with progressive style guidance applied
+    """
+    sigma_normalized = current_sigma / 1.0  # Normalize by initial sigma (typically 1.0)
+
+    # Determine guidance weights based on sigma
+    # Early (sigma > 0.8): focus on global statistics (color/brightness)
+    # Mid (0.3 < sigma < 0.8): add local texture constraints
+    # Late (sigma < 0.3): reduce constraints to focus on details
+
+    global_weight = min(1.0, 2.0 * (1 - sigma_normalized)) * guidance_scale  # Increase as noise decreases
+    texture_weight = 0.0
+
+    # Local texture matching only in mid-range sigma
+    if 0.2 < sigma_normalized < 0.8:
+        texture_weight = guidance_scale * (1 - abs(sigma_normalized - 0.5) / 0.3)
+
+    # Late stage: reduce all constraints to focus on details
+    if sigma_normalized < 0.2:
+        global_weight *= 0.3
+        texture_weight *= 0.1
+
+    print(f"[STYLE_GUIDANCE] sigma={current_sigma:.3f}, global_w={global_weight:.3f}, texture_w={texture_weight:.3f}")
+
+    styled_latents = latents.clone()
+
+    # 1. Global statistics matching (Adaptive Instance Normalization)
+    if global_weight > 0.01:
+        try:
+            current_mean, current_std = compute_global_style_statistics(latents, fg_mask)
+            target_mean, target_std = compute_global_style_statistics(id_latents, fg_mask)
+
+            # AdaIN: normalize by current statistics, then scale by target statistics
+            normalized = (latents - current_mean) / current_std
+            global_styled = normalized * target_std + target_mean
+
+            # Smooth interpolation to avoid abrupt changes
+            styled_latents = (1 - global_weight) * styled_latents + global_weight * global_styled
+
+        except Exception as e:
+            print(f"[STYLE_WARNING] Global statistics guidance failed: {e}")
+
+    # 2. Local texture matching using Gram matrix loss
+    if texture_weight > 0.01:
+        try:
+            print(f"[STYLE_DEBUG] Attempting texture guidance with weight {texture_weight:.3f}")
+
+            current_grams = compute_local_texture_grams(latents, fg_mask)
+            target_grams = compute_local_texture_grams(id_latents, fg_mask)
+
+            if current_grams is not None and target_grams is not None:
+                # Compute texture loss and gradient-based guidance
+                texture_loss = F.mse_loss(current_grams, target_grams)
+
+                if texture_loss.item() > 1e-6:
+                    # Use gradient to guide latents toward target texture
+                    # Note: We need to ensure latents requires_grad for gradient computation
+                    latents_for_grad = latents.detach().clone().requires_grad_(True)
+                    current_grams_grad = compute_local_texture_grams(latents_for_grad, fg_mask)
+
+                    if current_grams_grad is not None and len(current_grams_grad) > 0:
+                        texture_loss_for_grad = F.mse_loss(current_grams_grad, target_grams)
+                        grad = torch.autograd.grad(texture_loss_for_grad, latents_for_grad, retain_graph=False)[0]
+                        styled_latents = styled_latents - texture_weight * grad.detach()
+
+                        print(f"[TEXTURE_GUIDANCE] Applied texture guidance, loss={texture_loss.item():.6f}")
+                    else:
+                        print(f"[STYLE_WARNING] Could not compute gradient for texture guidance")
+                else:
+                    print(f"[STYLE_DEBUG] Texture loss too small: {texture_loss.item():.6f}")
+            else:
+                print(f"[STYLE_DEBUG] Texture grams not available: current={current_grams is not None}, target={target_grams is not None}")
+
+        except Exception as e:
+            print(f"[STYLE_WARNING] Texture guidance failed: {e}")
+            import traceback
+            traceback.print_exc()
+
+    return styled_latents
 
 def get_shared_fg_mask(id_fg_mask, curr_fg_mask, curr2id_argmax_indices, curr2id_valid_mask):
     curr_valid_mask = curr2id_valid_mask.flatten()
@@ -100,6 +278,8 @@ class CharaConsistPipeline(FluxPipeline):
         style_guidance_scale: float = 1.0,
         style_guidance_start_step: int = 1,
         style_guidance_end_step: int = 30,
+        style_guidance_start_sigma: float = 0.9,
+        style_guidance_end_sigma: float = 0.1,
         # Debug args
         debug_output_dir: str = None
     ):
@@ -196,7 +376,7 @@ class CharaConsistPipeline(FluxPipeline):
             interpolate_weight, interpolate_start_step, interpolate_decay_step, interpolate_end_step)
 
         # Style guidance setup - preserve state across calls
-        cfg_key = (use_style_guidance, style_guidance_scale, style_guidance_start_step, style_guidance_end_step)
+        cfg_key = (use_style_guidance, style_guidance_scale, style_guidance_start_step, style_guidance_end_step, style_guidance_start_sigma, style_guidance_end_sigma)
         current_cfg_key = getattr(self, '_cfg_initialized', None)
         if current_cfg_key != cfg_key:
             print(f"[STYLE_INIT] Style guidance params changed from {current_cfg_key} to {cfg_key}")
@@ -204,8 +384,10 @@ class CharaConsistPipeline(FluxPipeline):
             self._style_guidance_scale = style_guidance_scale
             self._style_guidance_weight_dict = get_style_guidance_weight(
                 style_guidance_scale, style_guidance_start_step, style_guidance_end_step)
+            self._start_sigma = style_guidance_start_sigma
+            self._end_sigma = style_guidance_end_sigma
             self._cfg_initialized = cfg_key
-            print(f"[STYLE_INIT] Created smooth weight schedule with {len(self._style_guidance_weight_dict)} steps")
+            print(f"[STYLE_INIT] Created progressive style guidance: scale={style_guidance_scale}, sigma_range=({style_guidance_start_sigma:.1f}, {style_guidance_end_sigma:.1f})")
         else:
             print(f"[STYLE_DEBUG] Style guidance params unchanged ({cfg_key}), preserving state")
 
@@ -399,24 +581,39 @@ class CharaConsistPipeline(FluxPipeline):
                     else:
                         print(f"[CFG_DEBUG] ID latents is None!")
 
-                if not is_id and not is_pre_run and self._use_style_guidance and self._id_latents is not None and i in self._style_guidance_weight_dict:
-                    guidance_scale = self._style_guidance_weight_dict[i]
-                    print(f"[CFG_ACTIVE] Step {i}: Applying guidance with scale {guidance_scale:.3f}")
+                if not is_id and not is_pre_run and self._use_style_guidance and self._id_latents is not None:
+                    # 获取当前sigma值 (FLUX使用sigma调度)
+                    current_sigma = self.scheduler.sigmas[i].item()
 
-                    # CFG core: guide latents toward ID latents
-                    id_latent_current = self._id_latents.to(latents.device, latents.dtype)
-                    latent_diff = latents - id_latent_current
-                    diff_norm = latent_diff.norm().item()
+                    # 检查是否在有效的sigma范围内
+                    if hasattr(self, '_start_sigma') and hasattr(self, '_end_sigma'):
+                        if not (self._end_sigma <= current_sigma <= self._start_sigma):
+                            continue
 
-                    # Show guidance effect before applying
-                    original_distance = diff_norm
-                    latents = latents - latent_diff * guidance_scale
+                    print(f"[STYLE_ACTIVE] Step {i}: sigma={current_sigma:.3f}")
 
-                    # Calculate effect
-                    new_diff = (latents - id_latent_current).norm().item()
-                    guidance_effect = original_distance - new_diff
+                    # 获取前景掩码
+                    fg_mask = spatial_kwargs.get("curr_fg_mask", None)
+                    if fg_mask is not None:
+                        fg_mask = fg_mask.to(latents.device)
 
-                    print(f"[CFG_DETAIL] Step {i}: diff_before={original_distance:.4f}, diff_after={new_diff:.4f}, effect={guidance_effect:.4f}")
+                    # 应用渐进式风格引导
+                    original_latents = latents.clone()
+                    styled_latents = apply_progressive_style_guidance(
+                        latents, self._id_latents, fg_mask, current_sigma,
+                        guidance_scale=self._style_guidance_scale
+                    )
+
+                    # 温和的混合策略 - 避免突变
+                    alpha = min(0.4, self._style_guidance_scale * (1 - current_sigma))
+                    latents = (1 - alpha) * original_latents + alpha * styled_latents
+
+                    # 确保latents保持正确的属性和维度
+                    latents = latents.detach()  # 移除梯度计算图，避免干扰transformer
+                    latents = latents.to(original_latents.dtype)  # 确保数据类型一致
+
+                    guidance_effect = (latents - original_latents).norm().item()
+                    print(f"[STYLE_DETAIL] sigma={current_sigma:.3f}, effect={guidance_effect:.4f}, alpha={alpha:.3f}")
 
                 # compute the previous noisy sample x_t -> x_t-1
                 latents_dtype = latents.dtype
