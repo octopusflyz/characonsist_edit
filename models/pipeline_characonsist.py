@@ -11,7 +11,7 @@ from diffusers.pipelines.flux.pipeline_flux import retrieve_timesteps, calculate
 from diffusers.pipelines.flux.pipeline_output import FluxPipelineOutput
 from diffusers.utils.torch_utils import randn_tensor
 
-from .attention_processor_characonsist import get_curr_fg_mask, get_cross_sim
+from .attention_processor_characonsist import get_curr_fg_mask, get_curr_fg_masks_two_stage, get_multi_object_fg_masks, set_fg_lengths, get_cross_sim
 
 
 def get_interpolate_weight(weight, start_step, decay_step, end_step):
@@ -168,7 +168,7 @@ class CharaConsistPipeline(FluxPipeline):
 
         def get_consist_kwargs(i):
             if is_id:
-                save_attn_weight = i == save_mask_point_step
+                save_attn_weight = (i == save_mask_point_step) or (i == num_inference_steps - 1)  # 确保在最后一步生成mask
                 save_attn_kv = (i < attn_end_step) and (i >= attn_start_step)
                 update_attn_kv = update_bg & (i < attn_end_step) and (i >= attn_start_step)
                 save_attn_out_for_sim = i == save_mask_point_step
@@ -235,10 +235,41 @@ class CharaConsistPipeline(FluxPipeline):
                 )[0]
 
                 if self.joint_attention_kwargs["save_attn_weight"]:
-                    curr_fg_mask = get_curr_fg_mask(self)
-                    spatial_kwargs["curr_fg_mask"] = curr_fg_mask
-                    if update_bg:
-                        spatial_kwargs["id_bg_mask"] = copy.deepcopy(~curr_fg_mask)
+                    # 检查是否有多对象模式
+                    # 通过检查processor的num_objects属性来判断
+                    has_multi_objects = False
+                    print("Debug pipeline: checking for multi-objects")
+                    for name in self.transformer.attn_processors:
+                        processor = self.transformer.attn_processors[name]
+                        if hasattr(processor, 'num_objects'):
+                            print(f"Debug pipeline: processor {name} has num_objects={processor.num_objects}")
+                            if processor.num_objects > 1:
+                                has_multi_objects = True
+                                break
+                        else:
+                            print(f"Debug pipeline: processor {name} has no num_objects attr")
+                    print(f"Debug pipeline: has_multi_objects={has_multi_objects}")
+
+                    if has_multi_objects:
+                        # 多对象模式：获取每个对象的独立mask
+                        print("Debug pipeline: calling get_multi_object_fg_masks")
+                        curr_fg_masks = get_multi_object_fg_masks(self)
+                        print(f"Debug pipeline: got {len(curr_fg_masks)} masks")
+                        spatial_kwargs["curr_fg_masks"] = curr_fg_masks
+                        # 为了向后兼容，第一个mask作为curr_fg_mask
+                        spatial_kwargs["curr_fg_mask"] = curr_fg_masks[0]
+                        if update_bg:
+                            # 对于多个mask，bg mask是所有fg mask的补集
+                            combined_fg_mask = torch.zeros_like(curr_fg_masks[0])
+                            for fg_mask in curr_fg_masks:
+                                combined_fg_mask = combined_fg_mask | fg_mask
+                            spatial_kwargs["id_bg_mask"] = copy.deepcopy(~combined_fg_mask)
+                    else:
+                        # 单对象模式
+                        curr_fg_mask = get_curr_fg_mask(self)
+                        spatial_kwargs["curr_fg_mask"] = curr_fg_mask
+                        if update_bg:
+                            spatial_kwargs["id_bg_mask"] = copy.deepcopy(~curr_fg_mask)
                         
                 if self.joint_attention_kwargs["save_cross_sim"]:
                     avg_cross_sim = get_cross_sim(self)

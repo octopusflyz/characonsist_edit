@@ -79,6 +79,9 @@ We provide a batch generation script in `inference.py`. Its functionality is ess
 - `use_interpolate`: Whether to use adaptive token merge. Enabling it improves consistency but increases CPU memory consumption.
 - `share_bg`: Whether to preserve the background unchanged
 - `save_mask`: Whether to save the automatically extracted masks during the generation process for visualization
+- `save_point_match`: Whether to save the point matching data for visualization
+- `visualize_masks`: Whether to display mask visualizations using matplotlib. Requires GUI support
+- `save_visualizations`: Whether to save mask visualization images to disk
 
 Generating consistent character in a fixed background:
 ```bash
@@ -87,7 +90,7 @@ python inference.py \
 --prompts_file examples/prompts-bg_fg.txt \
 --model_path path/to/FLUX.1-dev \
 --out_dir results/bg_fg \
---use_interpolate --save_mask --share_bg
+--use_interpolate --save_mask --share_bg --visualize_masks --save_visualizations
 ```
 
 Generating consistent character across different backgrounds:
@@ -97,7 +100,7 @@ python inference.py \
 --prompts_file examples/prompts-fg_only.txt \
 --model_path path/to/FLUX.1-dev \
 --out_dir results/fg_only \
---use_interpolate --save_mask
+--use_interpolate --save_mask --visualize_masks --save_visualizations
 ```
 
 ## BibTeX
