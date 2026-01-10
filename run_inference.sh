@@ -8,7 +8,7 @@ GPU_IDS="5 6"
 # For quick testing, limit to first prompt only
 QUICK_TEST=false
 MODEL_PATH="/mnt/netdisk2/zhangyf/model/FLUX.1-dev"
-OUT_DIR="results/mask/two_people_1"
+OUT_DIR="results/mask/two_people_simple_sep"
 
 # Image settings
 HEIGHT=1024

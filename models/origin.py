@@ -138,33 +138,19 @@ class CharaConsistAttnProcessor2_0:
         self.bg_len = 0
         self.real_len = 0
         self.size = size
-        # Multi-object support
-        self.num_objects = 1
-        self.object_token_ranges = None
-        self.fg_lengths = None
         # Save id info
         self.id_attn_bank = dict()
         self.attn_weights = dict()
         self.cross_sims = None
+        # Multi-fg support
+        self.fg_lengths = None
             
     def get_curr_attn_weights(self, q, k):
         attn_weights = torch.matmul(q[:, :, self.text_seq_len:], k[:, :, :self.real_len].transpose(-2, -1)).to(torch.float16)
         attn_weights = attn_weights.softmax(-1).sum(1)
         attn_weights = rearrange(attn_weights, "b (h w) s -> b s h w", h=self.size[0], w=self.size[1])
         bg_attn_weights = attn_weights[:, :self.bg_len].mean(1)
-
-        # 支持多对象：为每个对象单独计算fg注意力权重
-        if self.num_objects > 1 and self.object_token_ranges is not None:
-            object_fg_attn_weights = []
-            for start_token, end_token in self.object_token_ranges:
-                obj_fg_attn = attn_weights[:, start_token:end_token].mean(1)
-                object_fg_attn_weights.append(obj_fg_attn)
-            # 为了向后兼容，仍然返回平均的fg_attn_weights
-            fg_attn_weights = sum(object_fg_attn_weights) / len(object_fg_attn_weights)
-        else:
-            # 单对象情况，保持原有逻辑
-            fg_attn_weights = attn_weights[:, self.bg_len:].mean(1)
-
+        fg_attn_weights = attn_weights[:, self.bg_len:].mean(1)
         return bg_attn_weights, fg_attn_weights
 
     def get_curr_attn_weights_multi_fg(self, q, k, fg_lengths):
@@ -182,7 +168,7 @@ class CharaConsistAttnProcessor2_0:
             start_idx += fg_len
 
         return bg_attn_weights, fg_attn_weights
-
+    
     def get_curr_cross_sim(self, curr_hidden_states, timestep_ind):
         id_hidden_states = self.id_attn_bank[timestep_ind]["attn_out"].to(curr_hidden_states.device, non_blocking=True)
         sim = torch.matmul(
@@ -202,24 +188,25 @@ class CharaConsistAttnProcessor2_0:
         t2i_expand_mask = torch.ones((1, 1, self.text_seq_len, id_len), device=device, dtype=bool)
         return torch.cat((t2i_expand_mask, expand_mask), dim=-2)
     
-    def get_expanded_key_value(
+    def _get_single_expanded_key_value(
             self,
             image_rotary_emb,
             bg_share_flag,
             fg_share_flag,
             timestep_ind,
-            device, 
-            id_fg_mask=None,
-            id_bg_mask=None,
-            curr_fg_mask=None,
+            device,
+            id_fg_mask,
+            id_bg_mask,
+            curr_fg_mask,
             id_fg_inds=None,
             id_bg_inds=None,
             curr_fg_inds=None,
             **kwargs):
-        
+
         saved_key, saved_value = None, None
-        id_fg_mask = id_fg_mask.flatten().to(device, non_blocking=True)
-        curr_fg_mask = curr_fg_mask.flatten().to(device, non_blocking=True)
+
+        ori_saved_key = self.id_attn_bank[timestep_ind]["key"].to(device, non_blocking=True)
+        ori_saved_value = self.id_attn_bank[timestep_ind]["value"].to(device, non_blocking=True)
 
         ori_saved_key = self.id_attn_bank[timestep_ind]["key"].to(device, non_blocking=True)
         ori_saved_value = self.id_attn_bank[timestep_ind]["value"].to(device, non_blocking=True)
@@ -240,7 +227,7 @@ class CharaConsistAttnProcessor2_0:
             )
             saved_key = apply_rotary_emb(saved_key, image_rotary_emb_bg)
             id_fg_mask = torch.zeros([saved_key.shape[2]], device=device, dtype=torch.bool)
-        
+
         if fg_share_flag:
             saved_key_fg = ori_saved_key[:, :, id_fg_inds]
             saved_value_fg = ori_saved_value[:, :, id_fg_inds]
@@ -258,13 +245,65 @@ class CharaConsistAttnProcessor2_0:
                 saved_key = saved_key_fg
                 saved_value = saved_value_fg
                 id_fg_mask = torch.ones([saved_key.shape[2]], device=device, dtype=torch.bool)
-        
+
         expand_mask= self.get_expand_attn_mask(
             id_fg_mask, curr_fg_mask, bg_share_flag, fg_share_flag, device=device)
         attention_mask = torch.zeros(
-            (1, 1, self.text_seq_len + self.visual_seq_len, self.text_seq_len + self.visual_seq_len + len(id_fg_mask)), 
+            (1, 1, self.text_seq_len + self.visual_seq_len, self.text_seq_len + self.visual_seq_len + len(id_fg_mask)),
             device=device, dtype=torch.bfloat16)
         attention_mask[:, :, :, self.text_seq_len + self.visual_seq_len:].masked_fill_(expand_mask, float('-inf'))
+        return saved_key, saved_value, attention_mask
+
+    def get_expanded_key_value(
+            self,
+            image_rotary_emb,
+            bg_share_flag,
+            fg_share_flag,
+            timestep_ind,
+            device,
+            id_fg_mask=None,
+            id_bg_mask=None,
+            curr_fg_mask=None,
+            id_fg_inds=None,
+            id_bg_inds=None,
+            curr_fg_inds=None,
+            # Multi-fg support
+            id_fg_masks=None,
+            curr_fg_masks=None,
+            **kwargs):
+
+        # Handle multi-fg mask case
+        if id_fg_masks is not None and curr_fg_masks is not None:
+            # Multi-subject mode: process each mask separately and concatenate
+            all_saved_keys, all_saved_values, all_attention_masks = [], [], []
+            for i, (id_mask, curr_mask) in enumerate(zip(id_fg_masks, curr_fg_masks)):
+                id_mask_flat = id_mask.flatten().to(device, non_blocking=True)
+                curr_mask_flat = curr_mask.flatten().to(device, non_blocking=True)
+
+                single_key, single_value, attn_mask = self._get_single_expanded_key_value(
+                    image_rotary_emb, bg_share_flag, fg_share_flag, timestep_ind,
+                    device, id_mask_flat, id_bg_mask, curr_mask_flat,
+                    id_fg_inds, id_bg_inds, curr_fg_inds, **kwargs
+                )
+                all_saved_keys.append(single_key)
+                all_saved_values.append(single_value)
+                all_attention_masks.append(attn_mask)
+
+            saved_key = torch.cat(all_saved_keys, dim=2)
+            saved_value = torch.cat(all_saved_values, dim=2)
+            # Combine attention masks (this is a simplified approach - may need refinement)
+            attention_mask = all_attention_masks[0]  # Use first mask's attention pattern for now
+            id_fg_mask = torch.cat([mask.flatten().to(device, non_blocking=True) for mask in id_fg_masks], dim=0)
+        else:
+            # Single-subject mode: use original logic
+            id_fg_mask = id_fg_mask.flatten().to(device, non_blocking=True)
+            curr_fg_mask = curr_fg_mask.flatten().to(device, non_blocking=True)
+            saved_key, saved_value, attention_mask = self._get_single_expanded_key_value(
+                image_rotary_emb, bg_share_flag, fg_share_flag, timestep_ind,
+                device, id_fg_mask, id_bg_mask, curr_fg_mask,
+                id_fg_inds, id_bg_inds, curr_fg_inds, **kwargs
+            )
+
         return saved_key, saved_value, attention_mask
     
     
@@ -386,27 +425,18 @@ class CharaConsistAttnProcessor2_0:
             key = apply_rotary_emb(key, image_rotary_emb)
 
         if save_attn_weight:
-            bg_attn, fg_attn = self.get_curr_attn_weights(query, key)
-            # 支持多对象：保存每个对象的注意力权重
-            if self.num_objects > 1 and self.object_token_ranges is not None:
-                attn_weights_temp = torch.matmul(query[:, :, self.text_seq_len:], key[:, :, :self.real_len].transpose(-2, -1)).to(torch.float16)
-                attn_weights_temp = attn_weights_temp.softmax(-1).sum(1)
-                attn_weights_temp = rearrange(attn_weights_temp, "b (h w) s -> b s h w", h=self.size[0], w=self.size[1])
-                object_fg_attns = []
-                for start_token, end_token in self.object_token_ranges:
-                    obj_fg_attn = attn_weights_temp[:, start_token:end_token].mean(1)
-                    object_fg_attns.append(obj_fg_attn.to("cuda:0", non_blocking=True))
-                # 保存完整的fg_attn（用于第一阶段）以及objects（用于第二阶段）
-                self.attn_weights = dict(bg=bg_attn.to("cuda:0", non_blocking=True), fg=fg_attn.to("cuda:0", non_blocking=True), objects=object_fg_attns)
+            if self.fg_lengths is not None and len(self.fg_lengths) > 1:
+                bg_attn, fg_attns = self.get_curr_attn_weights_multi_fg(query, key, self.fg_lengths)
+                # Ensure all fg attention weights are on the same device
+                fg_attns_cuda = [attn.to("cuda:0", non_blocking=True) for attn in fg_attns]
+                self.attn_weights = dict(bg=bg_attn.to("cuda:0", non_blocking=True), fg=fg_attns_cuda)
             else:
-                # 单对象情况，保持原有格式
+                bg_attn, fg_attn = self.get_curr_attn_weights(query, key)
                 self.attn_weights = dict(bg=bg_attn.to("cuda:0", non_blocking=True), fg=fg_attn.to("cuda:0", non_blocking=True))
         
         fg_share_flag = self.fg_share_flag and fg_inter_img_attn
         bg_share_flag = self.bg_share_flag and bg_inter_img_attn and (not update_attn_kv)
-
-        # 在多对象模式下，暂时跳过扩展key-value逻辑，因为它是为单对象设计的
-        if (fg_share_flag or bg_share_flag) and self.num_objects <= 1:
+        if fg_share_flag or bg_share_flag:
             saved_key, saved_value, attention_mask = self.get_expanded_key_value(
                 (image_rotary_emb[0][self.text_seq_len:], image_rotary_emb[1][self.text_seq_len:]),
                 bg_share_flag,
@@ -416,9 +446,6 @@ class CharaConsistAttnProcessor2_0:
                 **spatial_kwargs)
             key = torch.cat([key, saved_key], dim=2)
             value = torch.cat([value, saved_value], dim=2)
-            attention_mask = attention_mask
-        else:
-            attention_mask = None
 
         hidden_states = F.scaled_dot_product_attention(query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False)
         hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
@@ -477,16 +504,7 @@ def reset_attn_processor(pipe, size, fg_share_freq=2, bg_share_freq=1):
     print(f"{reset_num} layers have been reset")
 
 
-def set_text_len(pipe, bg_len, real_len, num_objects=None, object_token_ranges=None):
-    """设置文本长度，支持多对象
-
-    Args:
-        pipe: pipeline对象
-        bg_len: 背景token长度
-        real_len: 总token长度
-        num_objects: 对象数量（可选）
-        object_token_ranges: 每个对象对应的token范围列表（可选）
-    """
+def set_text_len(pipe, bg_len, real_len):
     attn_processors = pipe.transformer.attn_processors
     reset_num = 0
     for name in attn_processors:
@@ -494,14 +512,21 @@ def set_text_len(pipe, bg_len, real_len, num_objects=None, object_token_ranges=N
         if isinstance(processor, CharaConsistAttnProcessor2_0):
             processor.bg_len = bg_len
             processor.real_len = real_len
-            if num_objects is not None:
-                processor.num_objects = num_objects
-            if object_token_ranges is not None:
-                processor.object_token_ranges = object_token_ranges
+            processor.fg_lengths = None  # Reset to single fg mode
             reset_num += 1
     print(f"{reset_num} layers' background and real text length have been reset to {bg_len} and {real_len}.")
-    if num_objects and num_objects > 1:
-        print(f"Multi-object mode: {num_objects} objects detected.")
+
+def set_text_len_multi_fg(pipe, bg_len, fg_lengths, real_len):
+    attn_processors = pipe.transformer.attn_processors
+    reset_num = 0
+    for name in attn_processors:
+        processor = attn_processors[name]
+        if isinstance(processor, CharaConsistAttnProcessor2_0):
+            processor.bg_len = bg_len
+            processor.fg_lengths = fg_lengths
+            processor.real_len = real_len
+            reset_num += 1
+    print(f"{reset_num} layers' background, foreground lengths, and real text length have been reset to {bg_len}, {fg_lengths}, and {real_len}.")
 
 def remove_small_holes_and_points(mask_tensor):
     n, h, w = mask_tensor.shape
@@ -532,186 +557,82 @@ def remove_small_holes_and_points(mask_tensor):
     return results
 
 def get_curr_fg_mask(pipe):
-    """获取前景mask，支持多对象"""
     attn_processors = pipe.transformer.attn_processors
-    all_attn_weights = dict(bg=[], fg=[], objects=[])
-    num_objects = 1
-
-    # 检查是否是多对象模式
+    all_attn_weights = dict(bg = [], fg = [])
     for name in attn_processors:
         processor = attn_processors[name]
         if isinstance(processor, CharaConsistAttnProcessor2_0):
-            if hasattr(processor, 'num_objects') and processor.num_objects > 1:
-                num_objects = processor.num_objects
-            break
+            saved_attns = processor.attn_weights
+            for k in saved_attns:
+                all_attn_weights[k].append(saved_attns[k])
+            processor.attn_weights = dict()
+    # Ensure all tensors are on the same device before operations
+    device = all_attn_weights["bg"][0].device
+    bg_attns = sum(attn.to(device) for attn in all_attn_weights["bg"]) / len(all_attn_weights["bg"])
+    fg_attns = sum(attn.to(device) for attn in all_attn_weights["fg"]) / len(all_attn_weights["fg"])
+
+    # 改进的阈值选择：使用前景置信度 + 自适应阈值
+    fg_confidence = fg_attns / (bg_attns + fg_attns + 1e-6)  # 前景置信度
+
+    # 自适应阈值选择：使用分位数而不是固定比较
+    # quantile需要float/double类型，先转换
+    fg_confidence_float = fg_confidence.float()
+    threshold = torch.quantile(fg_confidence_float, 0.55)  # 65%分位数作为阈值
+
+    mask = fg_confidence > threshold
+    return remove_small_holes_and_points(mask)
+
+def get_curr_fg_masks(pipe, fg_lengths):
+    """生成多个前景mask"""
+    attn_processors = pipe.transformer.attn_processors
+    all_attn_weights = dict(bg=[], fg=[])
 
     for name in attn_processors:
         processor = attn_processors[name]
         if isinstance(processor, CharaConsistAttnProcessor2_0):
             saved_attns = processor.attn_weights
             for k in saved_attns:
-                if k not in all_attn_weights:
-                    all_attn_weights[k] = []
-                all_attn_weights[k].append(saved_attns[k])
+                if k == "bg":
+                    all_attn_weights[k].append(saved_attns[k])
+                elif k == "fg" and isinstance(saved_attns[k], list):
+                    # 处理多个前景权重的情况
+                    if not all_attn_weights[k]:
+                        all_attn_weights[k] = [[] for _ in range(len(saved_attns[k]))]
+                    for i, fg_attn in enumerate(saved_attns[k]):
+                        all_attn_weights[k][i].append(fg_attn)
+                else:
+                    # 兼容单前景的情况
+                    if not all_attn_weights[k]:
+                        all_attn_weights[k] = []
+                    all_attn_weights[k].append(saved_attns[k])
             processor.attn_weights = dict()
 
-    bg_attns = sum(all_attn_weights["bg"]) / len(all_attn_weights["bg"])
+    # Ensure all tensors are on the same device before operations
+    device = all_attn_weights["bg"][0].device
+    bg_attns = sum(attn.to(device) for attn in all_attn_weights["bg"]) / len(all_attn_weights["bg"])
 
-    # 多对象模式：合并所有对象的mask
-    if num_objects > 1 and "objects" in all_attn_weights and len(all_attn_weights["objects"]) > 0:
-        # 获取第一个processor的object_token_ranges
-        object_token_ranges = None
-        for name in attn_processors:
-            processor = attn_processors[name]
-            if isinstance(processor, CharaConsistAttnProcessor2_0) and hasattr(processor, 'object_token_ranges'):
-                object_token_ranges = processor.object_token_ranges
-                break
+    fg_masks = []
+    if isinstance(all_attn_weights["fg"][0], list):
+        # 多个前景的情况
+        for i in range(len(fg_lengths)):
+            fg_attns_list = [attn[i].to(device) for attn in all_attn_weights["fg"]]
+            fg_attns = sum(fg_attns_list) / len(fg_attns_list)
 
-        # 为每个对象计算mask，然后合并（使用与get_multi_object_fg_masks相同的逻辑）
-        # 收集所有对象的attention权重
-        all_obj_attns = []
-        for obj_idx in range(num_objects):
-            obj_attn_list = [obj_attns[obj_idx] for obj_attns in all_attn_weights["objects"] if len(obj_attns) > obj_idx]
-            if len(obj_attn_list) > 0:
-                obj_attn = sum(obj_attn_list) / len(obj_attn_list)
-                # 确保obj_attn是2维的 [H, W]
-                if len(obj_attn.shape) == 3:
-                    obj_attn = obj_attn.squeeze(0)
-                elif len(obj_attn.shape) != 2:
-                    obj_attn = obj_attn.view(-1, obj_attn.shape[-2], obj_attn.shape[-1])[0]
-                all_obj_attns.append(obj_attn)
-            else:
-                all_obj_attns.append(torch.zeros_like(bg_attns))
-
-        # 使用对象间的相对比较来提取mask，然后合并
-        if len(all_obj_attns) > 0:
-            stacked_obj_attns = torch.stack(all_obj_attns, dim=0)  # [num_objects, H, W]
-            max_obj_attn, max_obj_idx = torch.max(stacked_obj_attns, dim=0)  # [H, W]
-
-            # 为每个对象生成mask并合并
-            combined_mask = None
-            for obj_idx in range(num_objects):
-                is_max_obj = (max_obj_idx == obj_idx)
-                obj_gt_bg = (all_obj_attns[obj_idx] > bg_attns)
-                obj_mask = is_max_obj & obj_gt_bg
-                # 确保obj_mask是2维的 [H, W]，然后添加batch维度
-                if len(obj_mask.shape) == 3:
-                    obj_mask = obj_mask.squeeze(0)  # 如果是 [1, H, W]，去掉第一个维度
-                elif len(obj_mask.shape) != 2:
-                    # 如果不是2维，尝试reshape
-                    obj_mask = obj_mask.view(-1, obj_mask.shape[-2], obj_mask.shape[-1])[0]
-                obj_mask = remove_small_holes_and_points(obj_mask.unsqueeze(0))[0]
-
-                if combined_mask is None:
-                    combined_mask = obj_mask
-                else:
-                    combined_mask = combined_mask | obj_mask
-
-            if combined_mask is not None:
-                return combined_mask
-        else:
-            # 回退到单对象模式
-            fg_attns = sum(all_attn_weights["fg"]) / len(all_attn_weights["fg"])
             fg_confidence = fg_attns / (bg_attns + fg_attns + 1e-6)
             fg_confidence_float = fg_confidence.float()
             threshold = torch.quantile(fg_confidence_float, 0.55)
             mask = fg_confidence > threshold
-            return remove_small_holes_and_points(mask)
+            fg_masks.append(remove_small_holes_and_points(mask))
     else:
-        # 单对象模式，保持原有逻辑
-        fg_attns = sum(all_attn_weights["fg"]) / len(all_attn_weights["fg"])
+        # 兼容单前景的情况
+        fg_attns = sum(attn.to(device) for attn in all_attn_weights["fg"]) / len(all_attn_weights["fg"])
         fg_confidence = fg_attns / (bg_attns + fg_attns + 1e-6)
         fg_confidence_float = fg_confidence.float()
         threshold = torch.quantile(fg_confidence_float, 0.55)
         mask = fg_confidence > threshold
-        return remove_small_holes_and_points(mask)
+        fg_masks.append(remove_small_holes_and_points(mask))
 
-def get_multi_object_fg_masks(pipe):
-    """获取整体前景mask和几何分割的对象mask（多对象模式）"""
-    attn_processors = pipe.transformer.attn_processors
-    all_attn_weights = dict(bg=[], fg=[])
-    num_objects = 2  # 默认为2个对象
-
-    # 获取对象信息
-    for name in attn_processors:
-        processor = attn_processors[name]
-        if isinstance(processor, CharaConsistAttnProcessor2_0):
-            if hasattr(processor, 'num_objects') and processor.num_objects > 1:
-                num_objects = processor.num_objects
-            break
-
-    if num_objects <= 1:
-        # 单对象模式，返回单个mask
-        fg_mask = get_curr_fg_mask(pipe)
-        return fg_mask, [fg_mask]
-
-    for name in attn_processors:
-        processor = attn_processors[name]
-        if isinstance(processor, CharaConsistAttnProcessor2_0):
-            saved_attns = processor.attn_weights
-            for k in saved_attns:
-                if k not in all_attn_weights:
-                    all_attn_weights[k] = []
-                all_attn_weights[k].append(saved_attns[k])
-            processor.attn_weights = dict()
-
-    bg_attns = sum(all_attn_weights["bg"]) / len(all_attn_weights["bg"])
-    fg_attns = sum(all_attn_weights["fg"]) / len(all_attn_weights["fg"])
-
-    # 确保是2维的 [H, W]
-    if len(bg_attns.shape) == 3:
-        bg_attns = bg_attns.squeeze(0)
-    elif len(bg_attns.shape) != 2:
-        bg_attns = bg_attns.view(-1, bg_attns.shape[-2], bg_attns.shape[-1])[0]
-
-    if len(fg_attns.shape) == 3:
-        fg_attns = fg_attns.squeeze(0)
-    elif len(fg_attns.shape) != 2:
-        fg_attns = fg_attns.view(-1, fg_attns.shape[-2], fg_attns.shape[-1])[0]
-
-    # 第一阶段：计算整体前景mask（基于阈值）
-    fg_confidence = fg_attns / (bg_attns + fg_attns + 1e-6)
-    fg_confidence_float = fg_confidence.float()
-    threshold = torch.quantile(fg_confidence_float, 0.55)
-    overall_fg_mask = fg_confidence > threshold
-
-    # 应用形态学操作确保mask完整
-    if len(overall_fg_mask.shape) == 2:
-        overall_fg_mask = overall_fg_mask.unsqueeze(0)
-    overall_fg_mask = remove_small_holes_and_points(overall_fg_mask)
-    overall_fg_mask = overall_fg_mask.squeeze(0)
-
-    # 第二阶段：直接在前景mask内进行几何分割
-    # 对于2个对象：左半边给对象0，右半边给对象1
-    h, w = overall_fg_mask.shape
-    object_masks = []
-
-    if num_objects == 2:
-        # 对象0：左半边
-        left_mask = overall_fg_mask.clone()
-        left_mask[:, w//2:] = 0  # 清除右半边
-        object_masks.append(left_mask)
-
-        # 对象1：右半边
-        right_mask = overall_fg_mask.clone()
-        right_mask[:, :w//2] = 0  # 清除左半边
-        object_masks.append(right_mask)
-    else:
-        # 对于更多对象，可以扩展分割逻辑
-        # 这里暂时只处理2个对象的情况
-        for i in range(num_objects):
-            obj_mask = overall_fg_mask.clone()
-            # 简单的等分分割
-            segment_width = w // num_objects
-            start_col = i * segment_width
-            end_col = (i + 1) * segment_width if i < num_objects - 1 else w
-            if i > 0:
-                obj_mask[:, :start_col] = 0
-            if end_col < w:
-                obj_mask[:, end_col:] = 0
-            object_masks.append(obj_mask)
-
-    return overall_fg_mask, object_masks
+    return fg_masks
 
 def get_cross_sim(pipe):
     attn_processors = pipe.transformer.attn_processors
@@ -738,92 +659,3 @@ def reset_size(pipe, h, w):
         if isinstance(processor, CharaConsistAttnProcessor2_0):
             processor.size = (h//16, w//16)
             processor.visual_seq_len = processor.size[0] * processor.size[1]
-
-def set_fg_lengths(pipe, fg_lengths):
-    """设置多对象前景长度"""
-    attn_processors = pipe.transformer.attn_processors
-    for name in attn_processors:
-        processor = attn_processors[name]
-        if isinstance(processor, CharaConsistAttnProcessor2_0):
-            processor.fg_lengths = fg_lengths
-def get_curr_fg_masks_two_stage(pipe, fg_lengths):
-    """两阶段前景mask生成"""
-    attn_processors = pipe.transformer.attn_processors
-    all_attn_weights = dict(bg=[], fg=[])
-
-    for name in attn_processors:
-        processor = attn_processors[name]
-        if isinstance(processor, CharaConsistAttnProcessor2_0):
-            saved_attns = processor.attn_weights
-            for k in saved_attns:
-                if k == "bg":
-                    all_attn_weights[k].append(saved_attns[k])
-                elif k == "fg" and isinstance(saved_attns[k], list):
-                    # 多对象情况
-                    if not all_attn_weights[k]:
-                        all_attn_weights[k] = [[] for _ in range(len(saved_attns[k]))]
-                    for i, fg_attn in enumerate(saved_attns[k]):
-                        all_attn_weights[k][i].append(fg_attn)
-                else:
-                    # 单对象兼容
-                    if not all_attn_weights[k]:
-                        all_attn_weights[k] = []
-                    all_attn_weights[k].append(saved_attns[k])
-
-    # 第一阶段：计算整体前景区域（使用置信度方式）
-    device = all_attn_weights["bg"][0].device
-    bg_attns = sum(attn.to(device) for attn in all_attn_weights["bg"]) / len(all_attn_weights["bg"])
-
-    # 计算整体前景权重（用于第一阶段）
-    if isinstance(all_attn_weights["fg"][0], list):
-        # 多对象：合并所有对象的权重
-        combined_fg_weights = []
-        for i in range(len(fg_lengths)):
-            fg_attns_list = [attn[i].to(device) for attn in all_attn_weights["fg"]]
-            combined_fg_weights.append(sum(fg_attns_list) / len(fg_attns_list))
-        overall_fg_attns = sum(combined_fg_weights) / len(combined_fg_weights)
-    else:
-        overall_fg_attns = sum(attn.to(device) for attn in all_attn_weights["fg"]) / len(all_attn_weights["fg"])
-
-    # 使用置信度确定整体前景区域
-    fg_confidence = overall_fg_attns / (bg_attns + overall_fg_attns + 1e-6)
-    fg_confidence_float = fg_confidence.float()
-    overall_threshold = torch.quantile(fg_confidence_float, 0.55)
-    overall_fg_mask = fg_confidence > overall_threshold
-    overall_fg_mask = remove_small_holes_and_points(overall_fg_mask)
-
-    # 第二阶段：在前景区域内直接比较各对象权重，赢者通吃
-    fg_masks = []
-    if isinstance(all_attn_weights["fg"][0], list):
-        # 收集所有对象的注意力权重
-        all_obj_attns = []
-        for i in range(len(fg_lengths)):
-            fg_attns_list = [attn[i].to(device) for attn in all_attn_weights["fg"]]
-            obj_attn = sum(fg_attns_list) / len(fg_attns_list)
-            all_obj_attns.append(obj_attn)
-
-        # 将所有对象权重堆叠起来 [num_objects, H, W]
-        stacked_obj_attns = torch.stack(all_obj_attns, dim=0)
-
-        # 找到每个像素的最大权重对象
-        max_obj_weights, max_obj_indices = torch.max(stacked_obj_attns, dim=0)
-
-        # 为每个对象生成mask：只在前景区域内，该对象赢得竞争
-        for obj_idx in range(len(fg_lengths)):
-            # 该对象在该像素赢得竞争
-            obj_wins = (max_obj_indices == obj_idx)
-            # 只在整体前景区域内
-            obj_mask = obj_wins & overall_fg_mask
-            fg_masks.append(remove_small_holes_and_points(obj_mask))
-    else:
-        # 单对象情况
-        fg_masks = [overall_fg_mask]
-
-    # 清空attn_weights
-    for name in attn_processors:
-        processor = attn_processors[name]
-        if isinstance(processor, CharaConsistAttnProcessor2_0):
-            processor.attn_weights = dict()
-
-    return fg_masks
-
