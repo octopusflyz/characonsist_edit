@@ -23,6 +23,7 @@ import numpy as np
 from models.attention_processor_characonsist import (
     reset_attn_processor,
     set_text_len,
+    set_text_len_multi_fg,
     reset_size,
     reset_id_bank,
 )
@@ -85,24 +86,65 @@ def modify_prompt_and_get_length(bg, fg, act, pipe):
     fg += " "
     prompt = bg + fg + act
     return prompt, get_text_tokens_length(pipe, bg), get_text_tokens_length(pipe, prompt)
+
+def parse_prompt_with_multi_fg(prompt):
+    """解析包含多个前景主体的prompt"""
+    parts = prompt.split("#")
+    if len(parts) < 3:
+        raise ValueError("Prompt must have at least bg#fg#act format")
+
+    bg = parts[0]
+    act = parts[-1]
+    fg_parts = parts[1:-1]  # 中间的都是fg描述
+
+    return bg, fg_parts, act
+
+def modify_prompt_and_get_lengths(bg, fg_parts, act, pipe):
+    """计算各部分的文本长度"""
+    bg += " "
+    fg_combined = " ".join(fg_parts) + " "
+    prompt = bg + fg_combined + act
+
+    bg_len = get_text_tokens_length(pipe, bg)
+
+    fg_lengths = []
+    for fg_part in fg_parts:
+        fg_part_with_space = fg_part + " "
+        fg_part_len = get_text_tokens_length(pipe, fg_part_with_space)
+        fg_lengths.append(fg_part_len)
+
+    real_len = get_text_tokens_length(pipe, prompt)
+
+    return prompt, bg_len, fg_lengths, real_len
             
 def load_prompt_file(pipe, file_path):
     with open(file_path, "r") as f:
         all_lines = f.readlines()
-    all_prompt_info, curr_prompts, curr_bg_len, curr_real_len = [], [], [], []
+    all_prompt_info, curr_prompts, curr_bg_len, curr_fg_lengths, curr_real_len = [], [], [], [], []
     for line in all_lines:
         prompt = line.strip()
         if len(prompt) > 0:
-            bg, fg, act = prompt.split("#")
-            prompt, bg_len, real_len = modify_prompt_and_get_length(bg, fg, act, pipe)
-            curr_prompts.append(prompt)
-            curr_bg_len.append(bg_len)
-            curr_real_len.append(real_len)
+            # 检测是否是多个人物主体格式
+            parts = prompt.split("#")
+            if len(parts) > 3:  # 多个人物主体格式
+                bg, fg_parts, act = parse_prompt_with_multi_fg(prompt)
+                prompt, bg_len, fg_lengths, real_len = modify_prompt_and_get_lengths(bg, fg_parts, act, pipe)
+                curr_prompts.append(prompt)
+                curr_bg_len.append(bg_len)
+                curr_fg_lengths.append(fg_lengths)
+                curr_real_len.append(real_len)
+            else:  # 传统单人物主体格式
+                bg, fg, act = prompt.split("#")
+                prompt, bg_len, real_len = modify_prompt_and_get_length(bg, fg, act, pipe)
+                curr_prompts.append(prompt)
+                curr_bg_len.append(bg_len)
+                curr_fg_lengths.append(None)  # 单人物格式
+                curr_real_len.append(real_len)
         else:
-            all_prompt_info.append((curr_prompts, curr_bg_len, curr_real_len))
-            curr_prompts, curr_bg_len, curr_real_len = [], [], []
+            all_prompt_info.append((curr_prompts, curr_bg_len, curr_fg_lengths, curr_real_len))
+            curr_prompts, curr_bg_len, curr_fg_lengths, curr_real_len = [], [], [], []
     if len(curr_prompts) > 0:
-        all_prompt_info.append((curr_prompts, curr_bg_len, curr_real_len))
+        all_prompt_info.append((curr_prompts, curr_bg_len, curr_fg_lengths, curr_real_len))
     return all_prompt_info
 
 from PIL import Image
@@ -158,7 +200,7 @@ if __name__ == "__main__":
     all_fg_prompts = []
     all_act_prompts = []
 
-    for prompt_ind, (prompts, bg_lens, real_lens) in enumerate(all_prompt_info):
+    for prompt_ind, (prompts, bg_lens, fg_lengths_list, real_lens) in enumerate(all_prompt_info):
         out_dir = os.path.join(args.out_dir, f"prompt_{prompt_ind}")
         os.makedirs(out_dir, exist_ok=True)
         if args.save_mask:
@@ -166,6 +208,9 @@ if __name__ == "__main__":
             os.makedirs(mask_out_dir, exist_ok=True)
         id_prompt = prompts[0]
         frm_prompts = prompts[1:]
+
+        # Set fg_lengths for multi-subject support
+        pipe.fg_lengths = fg_lengths_list[0]
 
         # Parse prompts for metadata (assuming format: bg#fg#act)
         if "#" in id_prompt:
@@ -182,7 +227,10 @@ if __name__ == "__main__":
         # ID Gen
         print("#" * 50)
         print("Generating ID image ...")
-        set_text_len(pipe, bg_lens[0], real_lens[0])
+        if fg_lengths_list[0] is not None:
+            set_text_len_multi_fg(pipe, bg_lens[0], fg_lengths_list[0], real_lens[0])
+        else:
+            set_text_len(pipe, bg_lens[0], real_lens[0])
         id_images, id_spatial_kwargs = pipe(
             id_prompt, is_id=True, generator = torch.Generator("cpu").manual_seed(args.seed), **pipe_kwargs)
         id_fg_mask = id_spatial_kwargs["curr_fg_mask"]
@@ -214,11 +262,22 @@ if __name__ == "__main__":
         }
 
         # Frame Gen
-        spatial_kwargs = dict(id_fg_mask = id_fg_mask, id_bg_mask = ~id_fg_mask)
+        # Handle multi-fg case for spatial_kwargs
+        if fg_lengths_list[0] is not None and len(fg_lengths_list[0]) > 1:
+            # Multi-subject case: need to create id_fg_masks from the saved masks
+            # For now, use the combined mask - this may need refinement
+            spatial_kwargs = dict(id_fg_mask = id_fg_mask, id_bg_mask = ~id_fg_mask)
+        else:
+            spatial_kwargs = dict(id_fg_mask = id_fg_mask, id_bg_mask = ~id_fg_mask)
         print("#" * 50)
         print("Generating frame images ...")
         for ind, prompt in enumerate(frm_prompts):
-            set_text_len(pipe, bg_lens[1:][ind], real_lens[1:][ind])
+            # Set fg_lengths for current frame
+            pipe.fg_lengths = fg_lengths_list[1:][ind]
+            if fg_lengths_list[1:][ind] is not None:
+                set_text_len_multi_fg(pipe, bg_lens[1:][ind], fg_lengths_list[1:][ind], real_lens[1:][ind])
+            else:
+                set_text_len(pipe, bg_lens[1:][ind], real_lens[1:][ind])
 
             # Parse frame prompt
             if "#" in prompt:

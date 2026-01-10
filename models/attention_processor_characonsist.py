@@ -142,13 +142,31 @@ class CharaConsistAttnProcessor2_0:
         self.id_attn_bank = dict()
         self.attn_weights = dict()
         self.cross_sims = None
+        # Multi-fg support
+        self.fg_lengths = None
             
     def get_curr_attn_weights(self, q, k):
         attn_weights = torch.matmul(q[:, :, self.text_seq_len:], k[:, :, :self.real_len].transpose(-2, -1)).to(torch.float16)
         attn_weights = attn_weights.softmax(-1).sum(1)
         attn_weights = rearrange(attn_weights, "b (h w) s -> b s h w", h=self.size[0], w=self.size[1])
         bg_attn_weights = attn_weights[:, :self.bg_len].mean(1)
-        fg_attn_weights = attn_weights[:, self.bg_len:].mean(1)       
+        fg_attn_weights = attn_weights[:, self.bg_len:].mean(1)
+        return bg_attn_weights, fg_attn_weights
+
+    def get_curr_attn_weights_multi_fg(self, q, k, fg_lengths):
+        """计算多个前景主体的注意力权重"""
+        attn_weights = torch.matmul(q[:, :, self.text_seq_len:], k[:, :, :self.real_len].transpose(-2, -1)).to(torch.float16)
+        attn_weights = attn_weights.softmax(-1).sum(1)
+        attn_weights = rearrange(attn_weights, "b (h w) s -> b s h w", h=self.size[0], w=self.size[1])
+
+        bg_attn_weights = attn_weights[:, :self.bg_len].mean(1)
+
+        fg_attn_weights = []
+        start_idx = self.bg_len
+        for fg_len in fg_lengths:
+            fg_attn_weights.append(attn_weights[:, start_idx:start_idx+fg_len].mean(1))
+            start_idx += fg_len
+
         return bg_attn_weights, fg_attn_weights
     
     def get_curr_cross_sim(self, curr_hidden_states, timestep_ind):
@@ -170,24 +188,25 @@ class CharaConsistAttnProcessor2_0:
         t2i_expand_mask = torch.ones((1, 1, self.text_seq_len, id_len), device=device, dtype=bool)
         return torch.cat((t2i_expand_mask, expand_mask), dim=-2)
     
-    def get_expanded_key_value(
+    def _get_single_expanded_key_value(
             self,
             image_rotary_emb,
             bg_share_flag,
             fg_share_flag,
             timestep_ind,
-            device, 
-            id_fg_mask=None,
-            id_bg_mask=None,
-            curr_fg_mask=None,
+            device,
+            id_fg_mask,
+            id_bg_mask,
+            curr_fg_mask,
             id_fg_inds=None,
             id_bg_inds=None,
             curr_fg_inds=None,
             **kwargs):
-        
+
         saved_key, saved_value = None, None
-        id_fg_mask = id_fg_mask.flatten().to(device, non_blocking=True)
-        curr_fg_mask = curr_fg_mask.flatten().to(device, non_blocking=True)
+
+        ori_saved_key = self.id_attn_bank[timestep_ind]["key"].to(device, non_blocking=True)
+        ori_saved_value = self.id_attn_bank[timestep_ind]["value"].to(device, non_blocking=True)
 
         ori_saved_key = self.id_attn_bank[timestep_ind]["key"].to(device, non_blocking=True)
         ori_saved_value = self.id_attn_bank[timestep_ind]["value"].to(device, non_blocking=True)
@@ -208,7 +227,7 @@ class CharaConsistAttnProcessor2_0:
             )
             saved_key = apply_rotary_emb(saved_key, image_rotary_emb_bg)
             id_fg_mask = torch.zeros([saved_key.shape[2]], device=device, dtype=torch.bool)
-        
+
         if fg_share_flag:
             saved_key_fg = ori_saved_key[:, :, id_fg_inds]
             saved_value_fg = ori_saved_value[:, :, id_fg_inds]
@@ -226,13 +245,65 @@ class CharaConsistAttnProcessor2_0:
                 saved_key = saved_key_fg
                 saved_value = saved_value_fg
                 id_fg_mask = torch.ones([saved_key.shape[2]], device=device, dtype=torch.bool)
-        
+
         expand_mask= self.get_expand_attn_mask(
             id_fg_mask, curr_fg_mask, bg_share_flag, fg_share_flag, device=device)
         attention_mask = torch.zeros(
-            (1, 1, self.text_seq_len + self.visual_seq_len, self.text_seq_len + self.visual_seq_len + len(id_fg_mask)), 
+            (1, 1, self.text_seq_len + self.visual_seq_len, self.text_seq_len + self.visual_seq_len + len(id_fg_mask)),
             device=device, dtype=torch.bfloat16)
         attention_mask[:, :, :, self.text_seq_len + self.visual_seq_len:].masked_fill_(expand_mask, float('-inf'))
+        return saved_key, saved_value, attention_mask
+
+    def get_expanded_key_value(
+            self,
+            image_rotary_emb,
+            bg_share_flag,
+            fg_share_flag,
+            timestep_ind,
+            device,
+            id_fg_mask=None,
+            id_bg_mask=None,
+            curr_fg_mask=None,
+            id_fg_inds=None,
+            id_bg_inds=None,
+            curr_fg_inds=None,
+            # Multi-fg support
+            id_fg_masks=None,
+            curr_fg_masks=None,
+            **kwargs):
+
+        # Handle multi-fg mask case
+        if id_fg_masks is not None and curr_fg_masks is not None:
+            # Multi-subject mode: process each mask separately and concatenate
+            all_saved_keys, all_saved_values, all_attention_masks = [], [], []
+            for i, (id_mask, curr_mask) in enumerate(zip(id_fg_masks, curr_fg_masks)):
+                id_mask_flat = id_mask.flatten().to(device, non_blocking=True)
+                curr_mask_flat = curr_mask.flatten().to(device, non_blocking=True)
+
+                single_key, single_value, attn_mask = self._get_single_expanded_key_value(
+                    image_rotary_emb, bg_share_flag, fg_share_flag, timestep_ind,
+                    device, id_mask_flat, id_bg_mask, curr_mask_flat,
+                    id_fg_inds, id_bg_inds, curr_fg_inds, **kwargs
+                )
+                all_saved_keys.append(single_key)
+                all_saved_values.append(single_value)
+                all_attention_masks.append(attn_mask)
+
+            saved_key = torch.cat(all_saved_keys, dim=2)
+            saved_value = torch.cat(all_saved_values, dim=2)
+            # Combine attention masks (this is a simplified approach - may need refinement)
+            attention_mask = all_attention_masks[0]  # Use first mask's attention pattern for now
+            id_fg_mask = torch.cat([mask.flatten().to(device, non_blocking=True) for mask in id_fg_masks], dim=0)
+        else:
+            # Single-subject mode: use original logic
+            id_fg_mask = id_fg_mask.flatten().to(device, non_blocking=True)
+            curr_fg_mask = curr_fg_mask.flatten().to(device, non_blocking=True)
+            saved_key, saved_value, attention_mask = self._get_single_expanded_key_value(
+                image_rotary_emb, bg_share_flag, fg_share_flag, timestep_ind,
+                device, id_fg_mask, id_bg_mask, curr_fg_mask,
+                id_fg_inds, id_bg_inds, curr_fg_inds, **kwargs
+            )
+
         return saved_key, saved_value, attention_mask
     
     
@@ -354,8 +425,14 @@ class CharaConsistAttnProcessor2_0:
             key = apply_rotary_emb(key, image_rotary_emb)
 
         if save_attn_weight:
-            bg_attn, fg_attn = self.get_curr_attn_weights(query, key)
-            self.attn_weights = dict(bg = bg_attn.to("cuda:0", non_blocking=True), fg = fg_attn.to("cuda:0", non_blocking=True))
+            if self.fg_lengths is not None and len(self.fg_lengths) > 1:
+                bg_attn, fg_attns = self.get_curr_attn_weights_multi_fg(query, key, self.fg_lengths)
+                # Ensure all fg attention weights are on the same device
+                fg_attns_cuda = [attn.to("cuda:0", non_blocking=True) for attn in fg_attns]
+                self.attn_weights = dict(bg=bg_attn.to("cuda:0", non_blocking=True), fg=fg_attns_cuda)
+            else:
+                bg_attn, fg_attn = self.get_curr_attn_weights(query, key)
+                self.attn_weights = dict(bg=bg_attn.to("cuda:0", non_blocking=True), fg=fg_attn.to("cuda:0", non_blocking=True))
         
         fg_share_flag = self.fg_share_flag and fg_inter_img_attn
         bg_share_flag = self.bg_share_flag and bg_inter_img_attn and (not update_attn_kv)
@@ -435,8 +512,21 @@ def set_text_len(pipe, bg_len, real_len):
         if isinstance(processor, CharaConsistAttnProcessor2_0):
             processor.bg_len = bg_len
             processor.real_len = real_len
+            processor.fg_lengths = None  # Reset to single fg mode
             reset_num += 1
     print(f"{reset_num} layers' background and real text length have been reset to {bg_len} and {real_len}.")
+
+def set_text_len_multi_fg(pipe, bg_len, fg_lengths, real_len):
+    attn_processors = pipe.transformer.attn_processors
+    reset_num = 0
+    for name in attn_processors:
+        processor = attn_processors[name]
+        if isinstance(processor, CharaConsistAttnProcessor2_0):
+            processor.bg_len = bg_len
+            processor.fg_lengths = fg_lengths
+            processor.real_len = real_len
+            reset_num += 1
+    print(f"{reset_num} layers' background, foreground lengths, and real text length have been reset to {bg_len}, {fg_lengths}, and {real_len}.")
 
 def remove_small_holes_and_points(mask_tensor):
     n, h, w = mask_tensor.shape
@@ -476,8 +566,10 @@ def get_curr_fg_mask(pipe):
             for k in saved_attns:
                 all_attn_weights[k].append(saved_attns[k])
             processor.attn_weights = dict()
-    bg_attns = sum(all_attn_weights["bg"]) / len(all_attn_weights["bg"])
-    fg_attns = sum(all_attn_weights["fg"]) / len(all_attn_weights["fg"])
+    # Ensure all tensors are on the same device before operations
+    device = all_attn_weights["bg"][0].device
+    bg_attns = sum(attn.to(device) for attn in all_attn_weights["bg"]) / len(all_attn_weights["bg"])
+    fg_attns = sum(attn.to(device) for attn in all_attn_weights["fg"]) / len(all_attn_weights["fg"])
 
     # 改进的阈值选择：使用前景置信度 + 自适应阈值
     fg_confidence = fg_attns / (bg_attns + fg_attns + 1e-6)  # 前景置信度
@@ -489,6 +581,58 @@ def get_curr_fg_mask(pipe):
 
     mask = fg_confidence > threshold
     return remove_small_holes_and_points(mask)
+
+def get_curr_fg_masks(pipe, fg_lengths):
+    """生成多个前景mask"""
+    attn_processors = pipe.transformer.attn_processors
+    all_attn_weights = dict(bg=[], fg=[])
+
+    for name in attn_processors:
+        processor = attn_processors[name]
+        if isinstance(processor, CharaConsistAttnProcessor2_0):
+            saved_attns = processor.attn_weights
+            for k in saved_attns:
+                if k == "bg":
+                    all_attn_weights[k].append(saved_attns[k])
+                elif k == "fg" and isinstance(saved_attns[k], list):
+                    # 处理多个前景权重的情况
+                    if not all_attn_weights[k]:
+                        all_attn_weights[k] = [[] for _ in range(len(saved_attns[k]))]
+                    for i, fg_attn in enumerate(saved_attns[k]):
+                        all_attn_weights[k][i].append(fg_attn)
+                else:
+                    # 兼容单前景的情况
+                    if not all_attn_weights[k]:
+                        all_attn_weights[k] = []
+                    all_attn_weights[k].append(saved_attns[k])
+            processor.attn_weights = dict()
+
+    # Ensure all tensors are on the same device before operations
+    device = all_attn_weights["bg"][0].device
+    bg_attns = sum(attn.to(device) for attn in all_attn_weights["bg"]) / len(all_attn_weights["bg"])
+
+    fg_masks = []
+    if isinstance(all_attn_weights["fg"][0], list):
+        # 多个前景的情况
+        for i in range(len(fg_lengths)):
+            fg_attns_list = [attn[i].to(device) for attn in all_attn_weights["fg"]]
+            fg_attns = sum(fg_attns_list) / len(fg_attns_list)
+
+            fg_confidence = fg_attns / (bg_attns + fg_attns + 1e-6)
+            fg_confidence_float = fg_confidence.float()
+            threshold = torch.quantile(fg_confidence_float, 0.55)
+            mask = fg_confidence > threshold
+            fg_masks.append(remove_small_holes_and_points(mask))
+    else:
+        # 兼容单前景的情况
+        fg_attns = sum(attn.to(device) for attn in all_attn_weights["fg"]) / len(all_attn_weights["fg"])
+        fg_confidence = fg_attns / (bg_attns + fg_attns + 1e-6)
+        fg_confidence_float = fg_confidence.float()
+        threshold = torch.quantile(fg_confidence_float, 0.55)
+        mask = fg_confidence > threshold
+        fg_masks.append(remove_small_holes_and_points(mask))
+
+    return fg_masks
 
 def get_cross_sim(pipe):
     attn_processors = pipe.transformer.attn_processors

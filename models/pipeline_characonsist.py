@@ -11,7 +11,7 @@ from diffusers.pipelines.flux.pipeline_flux import retrieve_timesteps, calculate
 from diffusers.pipelines.flux.pipeline_output import FluxPipelineOutput
 from diffusers.utils.torch_utils import randn_tensor
 
-from .attention_processor_characonsist import get_curr_fg_mask, get_cross_sim
+from .attention_processor_characonsist import get_curr_fg_mask, get_curr_fg_masks, get_cross_sim
 
 
 def get_interpolate_weight(weight, start_step, decay_step, end_step):
@@ -138,6 +138,9 @@ class CharaConsistPipeline(FluxPipeline):
         # 5. Prepare timesteps
         sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps)
         image_seq_len = latents.shape[1]
+
+        # Store fg_lengths for multi-subject support
+        self.fg_lengths = getattr(self, 'fg_lengths', None)
         mu = calculate_shift(
             image_seq_len,
             self.scheduler.config.base_image_seq_len,
@@ -235,10 +238,24 @@ class CharaConsistPipeline(FluxPipeline):
                 )[0]
 
                 if self.joint_attention_kwargs["save_attn_weight"]:
-                    curr_fg_mask = get_curr_fg_mask(self)
-                    spatial_kwargs["curr_fg_mask"] = curr_fg_mask
-                    if update_bg:
-                        spatial_kwargs["id_bg_mask"] = copy.deepcopy(~curr_fg_mask)
+                    # 检查是否有多个前景长度信息
+                    has_multi_fg = hasattr(self, 'fg_lengths') and self.fg_lengths is not None and len(self.fg_lengths) > 1
+                    if has_multi_fg:
+                        curr_fg_masks = get_curr_fg_masks(self, self.fg_lengths)
+                        spatial_kwargs["curr_fg_masks"] = curr_fg_masks
+                        # 为了向后兼容，第一个mask作为curr_fg_mask
+                        spatial_kwargs["curr_fg_mask"] = curr_fg_masks[0]
+                        if update_bg:
+                            # 对于多个mask，bg mask是所有fg mask的补集
+                            combined_fg_mask = torch.zeros_like(curr_fg_masks[0])
+                            for fg_mask in curr_fg_masks:
+                                combined_fg_mask = combined_fg_mask | fg_mask
+                            spatial_kwargs["id_bg_mask"] = copy.deepcopy(~combined_fg_mask)
+                    else:
+                        curr_fg_mask = get_curr_fg_mask(self)
+                        spatial_kwargs["curr_fg_mask"] = curr_fg_mask
+                        if update_bg:
+                            spatial_kwargs["id_bg_mask"] = copy.deepcopy(~curr_fg_mask)
                         
                 if self.joint_attention_kwargs["save_cross_sim"]:
                     avg_cross_sim = get_cross_sim(self)
