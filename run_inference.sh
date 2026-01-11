@@ -8,7 +8,7 @@ GPU_IDS="5 6"
 # For quick testing, limit to first prompt only
 QUICK_TEST=false
 MODEL_PATH="/mnt/netdisk2/zhangyf/model/FLUX.1-dev"
-OUT_DIR="results/mask/two_people_simple_sep"
+OUT_DIR="results/mask/two_people_simple_v2_sep"
 
 # Image settings
 HEIGHT=1024
@@ -20,13 +20,13 @@ SEED=2025
 BG_PROMPTS=(
     "in a colorful theme park, roller coasters and amusement rides in the background,"
     "in an arcade, flashing lights and game machines in the background,"
-    "in a fantasy-themed park, castles and fairy tale characters in the background,"
+    "in a fantasy-themed park, castles and fairy tale cartoon characters in the background,"
 )
-FG_PROMPT="a American girl with long brown hair, wearing a blue dress and a white hat#a Chinese girl with long black hair, wearing a red dress and a blue hat"
+FG_PROMPT="a young white boy with curly brown hair, wearing a blue T-shirt and brown shorts, # a young black boy with straight brown hair, wearing a brown T-shirt and blue shorts, "
 ACT_PROMPTS=(
     "riding a roller coaster, excited expression, front view"
     "playing an arcade game, focused expression, side view"
-    "posing with a costumed character, happy expression, front view"
+    "posing with one cartoon-style costumed-character in the background, happy expression, front view"
 )
 
 # Create temporary prompts file

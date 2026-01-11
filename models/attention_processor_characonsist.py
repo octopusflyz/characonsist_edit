@@ -616,7 +616,13 @@ def get_curr_fg_mask(pipe):
             fg_confidence_float = fg_confidence.float()
             threshold = torch.quantile(fg_confidence_float, 0.55)
             mask = fg_confidence > threshold
-            return remove_small_holes_and_points(mask)
+            # 确保输入到remove_small_holes_and_points的是3维tensor
+            if len(mask.shape) == 2:
+                mask = mask.unsqueeze(0)
+            mask = remove_small_holes_and_points(mask)
+            if mask.dim() == 3:
+                mask = mask.squeeze(0)
+            return mask
     else:
         # 单对象模式，保持原有逻辑
         fg_attns = sum(all_attn_weights["fg"]) / len(all_attn_weights["fg"])
@@ -624,7 +630,13 @@ def get_curr_fg_mask(pipe):
         fg_confidence_float = fg_confidence.float()
         threshold = torch.quantile(fg_confidence_float, 0.55)
         mask = fg_confidence > threshold
-        return remove_small_holes_and_points(mask)
+        # 确保输入到remove_small_holes_and_points的是3维tensor
+        if len(mask.shape) == 2:
+            mask = mask.unsqueeze(0)
+        mask = remove_small_holes_and_points(mask)
+        if mask.dim() == 3:
+            mask = mask.squeeze(0)
+        return mask
 
 def get_multi_object_fg_masks(pipe):
     """获取整体前景mask和几何分割的对象mask（多对象模式）"""
@@ -669,17 +681,22 @@ def get_multi_object_fg_masks(pipe):
     elif len(fg_attns.shape) != 2:
         fg_attns = fg_attns.view(-1, fg_attns.shape[-2], fg_attns.shape[-1])[0]
 
-    # 第一阶段：计算整体前景mask（基于阈值）
-    fg_confidence = fg_attns / (bg_attns + fg_attns + 1e-6)
-    fg_confidence_float = fg_confidence.float()
-    threshold = torch.quantile(fg_confidence_float, 0.55)
-    overall_fg_mask = fg_confidence > threshold
+    # 第一阶段：计算整体前景mask（与origin.py中的get_curr_fg_mask完全一致）
+    # 改进的阈值选择：使用前景置信度 + 自适应阈值
+    fg_confidence = fg_attns / (bg_attns + fg_attns + 1e-6)  # 前景置信度
 
-    # 应用形态学操作确保mask完整
+    # 自适应阈值选择：使用分位数而不是固定比较
+    # quantile需要float/double类型，先转换
+    fg_confidence_float = fg_confidence.float()
+    threshold = torch.quantile(fg_confidence_float, 0.55)  # 55%分位数作为阈值
+
+    overall_fg_mask = fg_confidence > threshold
+    # 确保输入到remove_small_holes_and_points的是3维tensor
     if len(overall_fg_mask.shape) == 2:
         overall_fg_mask = overall_fg_mask.unsqueeze(0)
     overall_fg_mask = remove_small_holes_and_points(overall_fg_mask)
-    overall_fg_mask = overall_fg_mask.squeeze(0)
+    if overall_fg_mask.dim() == 3:
+        overall_fg_mask = overall_fg_mask.squeeze(0)
 
     # 第二阶段：直接在前景mask内进行几何分割
     # 对于2个对象：左半边给对象0，右半边给对象1
@@ -790,7 +807,12 @@ def get_curr_fg_masks_two_stage(pipe, fg_lengths):
     fg_confidence_float = fg_confidence.float()
     overall_threshold = torch.quantile(fg_confidence_float, 0.55)
     overall_fg_mask = fg_confidence > overall_threshold
+    # 确保输入到remove_small_holes_and_points的是3维tensor
+    if len(overall_fg_mask.shape) == 2:
+        overall_fg_mask = overall_fg_mask.unsqueeze(0)
     overall_fg_mask = remove_small_holes_and_points(overall_fg_mask)
+    if overall_fg_mask.dim() == 3:
+        overall_fg_mask = overall_fg_mask.squeeze(0)
 
     # 第二阶段：在前景区域内直接比较各对象权重，赢者通吃
     fg_masks = []
@@ -814,7 +836,13 @@ def get_curr_fg_masks_two_stage(pipe, fg_lengths):
             obj_wins = (max_obj_indices == obj_idx)
             # 只在整体前景区域内
             obj_mask = obj_wins & overall_fg_mask
-            fg_masks.append(remove_small_holes_and_points(obj_mask))
+            # 确保输入到remove_small_holes_and_points的是3维tensor
+            if len(obj_mask.shape) == 2:
+                obj_mask = obj_mask.unsqueeze(0)
+            obj_mask = remove_small_holes_and_points(obj_mask)
+            if obj_mask.dim() == 3:
+                obj_mask = obj_mask.squeeze(0)
+            fg_masks.append(obj_mask)
     else:
         # 单对象情况
         fg_masks = [overall_fg_mask]
